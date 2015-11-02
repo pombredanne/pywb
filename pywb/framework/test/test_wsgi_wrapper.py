@@ -1,5 +1,4 @@
 from pywb.framework.wsgi_wrappers import init_app
-from pywb.framework.wsgi_wrappers import start_wsgi_server
 
 from pywb.utils.wbexception import AccessException
 
@@ -14,7 +13,7 @@ class TestOkApp:
 
 class TestErrApp:
     def __call__(self, env):
-        raise Exception('Test Error')
+        raise Exception('Test Unexpected Error')
 
 class TestCustomErrApp:
     def __call__(self, env):
@@ -22,7 +21,7 @@ class TestCustomErrApp:
 
 
 def initer(app_class):
-    def init():
+    def init(config=None):
         return app_class()
     return init
 
@@ -41,8 +40,8 @@ def test_err_app():
     testapp = webtest.TestApp(the_app)
     resp = testapp.get('/abc', expect_errors=True)
 
-    assert resp.status_int == 400
-    assert '400 Bad Request Error: Test Error' in resp.body
+    assert resp.status_int == 500
+    assert '500 Internal Server Error Error: Test Unexpected Error' in resp.body
 
 def test_custom_err_app():
     the_app = init_app(initer(TestCustomErrApp), load_yaml=False)

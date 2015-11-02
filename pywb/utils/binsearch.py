@@ -16,7 +16,9 @@ def binsearch_offset(reader, key, compare_func=cmp, block_size=8192):
     Optional compare_func may be specified
     """
     min_ = 0
-    max_ = reader.getsize() / block_size
+
+    reader.seek(0, 2)
+    max_ = reader.tell() / block_size
 
     while max_ - min_ > 1:
         mid = min_ + ((max_ - min_) / 2)
@@ -82,7 +84,7 @@ def linearsearch(iter_, key, prev_size=0, compare_func=cmp):
 
     # no matches, so return empty iterator
     if not matched:
-        return []
+        return iter([])
 
     return itertools.chain(prev_deque, iter_)
 
@@ -114,8 +116,8 @@ def iter_range(reader, start, end, prev_size=0):
     iter_ = search(reader, start, prev_size=prev_size)
 
     end_iter = itertools.takewhile(
-       lambda line: line < end,
-       iter_)
+        lambda line: line < end,
+        iter_)
 
     return end_iter
 

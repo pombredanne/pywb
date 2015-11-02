@@ -8,6 +8,7 @@ import time
 import datetime
 import calendar
 from itertools import imap
+from email.utils import parsedate, formatdate
 
 #=================================================================
 # str <-> datetime conversion
@@ -17,8 +18,9 @@ DATE_TIMESPLIT = re.compile(r'[^\d]')
 
 TIMESTAMP_14 = '%Y%m%d%H%M%S'
 
-#PAD_STAMP_END = '29991231235959'
-PAD_6 = '299912'
+PAD_14_DOWN = '10000101000000'
+PAD_14_UP =   '29991231235959'
+PAD_6_UP =    '299912'
 
 
 def iso_date_to_datetime(string):
@@ -38,6 +40,30 @@ def iso_date_to_datetime(string):
     return the_datetime
 
 
+def http_date_to_datetime(string):
+    """
+    >>> http_date_to_datetime('Thu, 26 Dec 2013 09:50:10 GMT')
+    datetime.datetime(2013, 12, 26, 9, 50, 10)
+    """
+    return datetime.datetime(*parsedate(string)[:6])
+
+
+def datetime_to_http_date(the_datetime):
+    """
+    >>> datetime_to_http_date(datetime.datetime(2013, 12, 26, 9, 50, 10))
+    'Thu, 26 Dec 2013 09:50:10 GMT'
+
+    # Verify inverses
+    >>> x = 'Thu, 26 Dec 2013 09:50:10 GMT'
+    >>> datetime_to_http_date(http_date_to_datetime(x)) == x
+    True
+    """
+    timeval = calendar.timegm(the_datetime.utctimetuple())
+    return formatdate(timeval=timeval,
+                      localtime=False,
+                      usegmt=True)
+
+
 def datetime_to_timestamp(the_datetime):
     """
     >>> datetime_to_timestamp(datetime.datetime(2013, 12, 26, 10, 11, 12))
@@ -45,6 +71,30 @@ def datetime_to_timestamp(the_datetime):
     """
 
     return the_datetime.strftime(TIMESTAMP_14)
+
+
+def timestamp_now():
+    """
+    >>> len(timestamp_now())
+    14
+    """
+    return datetime_to_timestamp(datetime.datetime.utcnow())
+
+
+def timestamp20_now():
+    """
+    Create 20-digit timestamp, useful to timestamping temp files
+
+    >>> n = timestamp20_now()
+    >>> timestamp20_now() >= n
+    True
+
+    >>> len(n)
+    20
+
+    """
+    now = datetime.datetime.utcnow()
+    return now.strftime('%Y%m%d%H%M%S%f')
 
 
 def iso_date_to_timestamp(string):
@@ -59,19 +109,30 @@ def iso_date_to_timestamp(string):
     return datetime_to_timestamp(iso_date_to_datetime(string))
 
 
-# pad to certain length (default 6)
-def _pad_timestamp(string, pad_str=PAD_6):
+def http_date_to_timestamp(string):
     """
-    >>> _pad_timestamp('20')
+    >>> http_date_to_timestamp('Thu, 26 Dec 2013 09:50:00 GMT')
+    '20131226095000'
+
+    >>> http_date_to_timestamp('Sun, 26 Jan 2014 20:08:04 GMT')
+    '20140126200804'
+    """
+    return datetime_to_timestamp(http_date_to_datetime(string))
+
+
+# pad to certain length (default 6)
+def pad_timestamp(string, pad_str=PAD_6_UP):
+    """
+    >>> pad_timestamp('20')
     '209912'
 
-    >>> _pad_timestamp('2014')
+    >>> pad_timestamp('2014')
     '201412'
 
-    >>> _pad_timestamp('20141011')
+    >>> pad_timestamp('20141011')
     '20141011'
 
-    >>> _pad_timestamp('201410110010')
+    >>> pad_timestamp('201410110010')
     '201410110010'
      """
 
@@ -169,7 +230,7 @@ def timestamp_to_datetime(string):
     """
 
     # pad to 6 digits
-    string = _pad_timestamp(string, PAD_6)
+    string = pad_timestamp(string, PAD_6_UP)
 
     def clamp(val, min_, max_):
         try:
@@ -208,11 +269,35 @@ def timestamp_to_sec(string):
     >>> timestamp_to_sec('20131226095010')
     1388051410
 
+    # rounds to end of 2014
     >>> timestamp_to_sec('2014')
     1420070399
     """
 
     return calendar.timegm(timestamp_to_datetime(string).utctimetuple())
+
+
+def sec_to_timestamp(secs):
+    """
+    >>> sec_to_timestamp(1388051410)
+    '20131226095010'
+
+    >>> sec_to_timestamp(1420070399)
+    '20141231235959'
+    """
+
+    return datetime_to_timestamp(datetime.datetime.utcfromtimestamp(secs))
+
+
+def timestamp_to_http_date(string):
+    """
+    >>> timestamp_to_http_date('20131226095000')
+    'Thu, 26 Dec 2013 09:50:00 GMT'
+
+    >>> timestamp_to_http_date('20140126200804')
+    'Sun, 26 Jan 2014 20:08:04 GMT'
+    """
+    return datetime_to_http_date(timestamp_to_datetime(string))
 
 
 if __name__ == "__main__":

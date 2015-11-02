@@ -6,6 +6,14 @@ from cdxobject import CDXException
 class CDXQuery(object):
     def __init__(self, **kwargs):
         self.params = kwargs
+        if not self.params.get('matchType'):
+            url = self.params.get('url', '')
+            if url.startswith('*.'):
+                self.params['url'] = url[2:]
+                self.params['matchType'] = 'domain'
+            elif url.endswith('*'):
+                self.params['url'] = url[:-1]
+                self.params['matchType'] = 'prefix'
 
     @property
     def key(self):
@@ -68,6 +76,14 @@ class CDXQuery(object):
         return v.split(',') if v else None
 
     @property
+    def from_ts(self):
+        return self.params.get('from') or self.params.get('from_ts')
+
+    @property
+    def to_ts(self):
+        return self.params.get('to')
+
+    @property
     def closest(self):
         # sort=closest is not required
         return self.params.get('closest')
@@ -85,6 +101,18 @@ class CDXQuery(object):
     @property
     def secondary_index_only(self):
         return self._get_bool('showPagedIndex')
+
+    @property
+    def page(self):
+        return int(self.params.get('page', 0))
+
+    @property
+    def page_size(self):
+        return self.params.get('pageSize')
+
+    @property
+    def page_count(self):
+        return self._get_bool('showNumPages')
 
     def _get_bool(self, name, def_val=False):
         v = self.params.get(name)

@@ -1,101 +1,242 @@
-import urllib2
-import os
-import sys
-import datetime
-import mimetypes
-
-from pywb.utils.loaders import is_http
-from pywb.utils.timeutils import datetime_to_timestamp
-from pywb.utils.statusandheaders import StatusAndHeaders
-from pywb.utils.canonicalize import canonicalize
-
-from pywb.rewrite.url_rewriter import UrlRewriter
-from pywb.rewrite.rewrite_content import RewriteContent
-
-
 """
 Fetch a url from live web and apply rewriting rules
 """
 
-#=================================================================
-def get_status_and_stream(url):
-    resp = urllib2.urlopen(url)
+from requests import request as live_request
 
-    headers = []
-    for name, value in resp.info().dict.iteritems():
-        headers.append((name, value))
+import mimetypes
+import logging
+import os
 
-    status_headers = StatusAndHeaders('200 OK', headers)
-    stream = resp
+from urlparse import urlsplit
 
-    return (status_headers, stream)
+from pywb.utils.loaders import is_http, LimitReader, LocalFileLoader, to_file_url
+from pywb.utils.loaders import extract_client_cookie
+from pywb.utils.timeutils import timestamp_now
+from pywb.utils.statusandheaders import StatusAndHeaders
+from pywb.utils.canonicalize import canonicalize
 
-#=================================================================
-def get_local_file(uri):
-    fh = open(uri)
-
-    content_type, _ = mimetypes.guess_type(uri)
-
-    # create fake headers for local file
-    status_headers = StatusAndHeaders('200 OK', [('Content-Type', content_type)])
-    stream = fh
-
-    return (status_headers, stream)
-
-#=================================================================
-def get_rewritten(url, urlrewriter, urlkey=None, head_insert_func=None):
-    if is_http(url):
-        (status_headers, stream) = get_status_and_stream(url)
-    else:
-        (status_headers, stream) = get_local_file(url)
-
-    # explicit urlkey may be passed in (say for testing)
-    if not urlkey:
-        urlkey = canonicalize(url)
-
-    rewriter = RewriteContent()
-
-    result = rewriter.rewrite_content(urlrewriter,
-                                      status_headers,
-                                      stream,
-                                      head_insert_func=head_insert_func,
-                                      urlkey=urlkey)
-
-    status_headers, gen = result
-
-    buff = ''
-    for x in gen:
-        buff += x
-
-    return (status_headers, buff)
-
-#=================================================================
-def main():  # pragma: no cover
-    if len(sys.argv) < 2:
-        print 'Usage: {0} url-to-fetch [wb-url-target] [extra-prefix]'.format(sys.argv[0])
-        return 1
-    else:
-        url = sys.argv[1]
-
-    if len(sys.argv) >= 3:
-        wburl_str = sys.argv[2]
-        if wburl_str.startswith('/'):
-            wburl_str = wburl_str[1:]
-
-        prefix, wburl_str = wburl_str.split('/', 1)
-        prefix = '/' + prefix + '/'
-    else:
-        wburl_str = datetime_to_timestamp(datetime.datetime.now()) + '/http://example.com/path/sample.html'
-        prefix = '/pywb_rewrite/'
-
-    urlrewriter = UrlRewriter(wburl_str, prefix)
-
-    status_headers, buff = get_rewritten(url, urlrewriter)
-
-    sys.stdout.write(buff)
-    return 0
+from rewrite_content import RewriteContent
 
 
 #=================================================================
-if __name__ == "__main__":
-    exit(main())
+class LiveRewriter(object):
+    def __init__(self, is_framed_replay=False, proxies=None):
+        self.rewriter = RewriteContent(is_framed_replay=is_framed_replay)
+
+        self.proxies = proxies
+
+        self.live_request = live_request
+
+        if self.proxies:
+            logging.debug('Live Rewrite via proxy ' + str(proxies))
+
+            if isinstance(proxies, str):
+                self.proxies = {'http': proxies,
+                                'https': proxies}
+
+        else:
+            logging.debug('Live Rewrite Direct (no proxy)')
+
+    def fetch_local_file(self, uri):
+        #fh = open(uri)
+        fh = LocalFileLoader().load(uri)
+
+        content_type, _ = mimetypes.guess_type(uri)
+
+        # create fake headers for local file
+        status_headers = StatusAndHeaders('200 OK',
+                                          [('Content-Type', content_type)])
+        stream = fh
+
+        return (status_headers, stream)
+
+    def translate_headers(self, url, urlkey, env):
+        headers = {}
+
+        splits = urlsplit(url)
+        has_cookies = False
+
+        for name, value in env.iteritems():
+            if name == 'HTTP_HOST':
+                name = 'Host'
+                value = splits.netloc
+
+            elif name == 'HTTP_ORIGIN':
+                name = 'Origin'
+                value = (splits.scheme + '://' + splits.netloc)
+
+            elif name == 'HTTP_X_CSRFTOKEN':
+                name = 'X-CSRFToken'
+                cookie_val = extract_client_cookie(env, 'csrftoken')
+                if cookie_val:
+                    value = cookie_val
+
+            elif name == 'HTTP_REFERER':
+                continue
+
+            elif name == 'HTTP_X_FORWARDED_PROTO':
+                name = 'X-Forwarded-Proto'
+                value = splits.scheme
+
+            elif name == 'HTTP_COOKIE':
+                name = 'Cookie'
+                value = self._req_cookie_rewrite(urlkey, value)
+                has_cookies = True
+
+            elif name.startswith('HTTP_'):
+                name = name[5:].title().replace('_', '-')
+
+            elif name in ('CONTENT_LENGTH', 'CONTENT_TYPE'):
+                name = name.title().replace('_', '-')
+
+            elif name == 'REL_REFERER':
+                name = 'Referer'
+            else:
+                value = None
+
+            if value:
+                headers[name] = value
+
+        if not has_cookies:
+            value = self._req_cookie_rewrite(urlkey, '')
+            if value:
+                headers['Cookie'] = value
+
+        return headers
+
+    def _req_cookie_rewrite(self, urlkey, value):
+        rule = self.rewriter.ruleset.get_first_match(urlkey)
+        if not rule or not rule.req_cookie_rewrite:
+            return value
+
+        for cr in rule.req_cookie_rewrite:
+            try:
+                value = cr['rx'].sub(cr['replace'], value)
+            except KeyError:
+                pass
+
+        return value
+
+    def fetch_http(self, url,
+                   urlkey=None,
+                   env=None,
+                   req_headers=None,
+                   follow_redirects=False,
+                   ignore_proxies=False,
+                   verify=True):
+
+        method = 'GET'
+        data = None
+
+        proxies = None
+        if not ignore_proxies:
+            proxies = self.proxies
+
+        if not req_headers:
+            req_headers = {}
+
+        if env is not None:
+            method = env['REQUEST_METHOD'].upper()
+            input_ = env['wsgi.input']
+
+            req_headers.update(self.translate_headers(url, urlkey, env))
+
+            if method in ('POST', 'PUT'):
+                len_ = env.get('CONTENT_LENGTH')
+                if len_:
+                    data = LimitReader(input_, int(len_))
+                else:
+                    data = input_
+
+        response = self.live_request(method=method,
+                                     url=url,
+                                     data=data,
+                                     headers=req_headers,
+                                     allow_redirects=follow_redirects,
+                                     proxies=proxies,
+                                     stream=True,
+                                     verify=verify)
+
+        statusline = str(response.status_code) + ' ' + response.reason
+
+        headers = response.headers.items()
+        stream = response.raw
+
+        status_headers = StatusAndHeaders(statusline, headers)
+
+        return (status_headers, stream)
+
+    def fetch_request(self, url, urlrewriter,
+                      head_insert_func=None,
+                      urlkey=None,
+                      env=None,
+                      req_headers={},
+                      timestamp=None,
+                      follow_redirects=False,
+                      ignore_proxies=False,
+                      verify=True,
+                      remote_only=True):
+
+        ts_err = url.split('///')
+
+        # fixup for accidental erroneous rewrite which has ///
+        # (unless file:///)
+        if len(ts_err) > 1 and ts_err[0] != 'file:':
+            url = 'http://' + ts_err[1]
+
+        if url.startswith('//'):
+            url = 'http:' + url
+
+        if remote_only or is_http(url):
+            is_remote = True
+        else:
+            is_remote = False
+            if not url.startswith('file:'):
+                url = to_file_url(url)
+
+        # explicit urlkey may be passed in (say for testing)
+        if not urlkey:
+            urlkey = canonicalize(url)
+
+        if is_remote:
+            (status_headers, stream) = self.fetch_http(url, urlkey, env,
+                                                       req_headers,
+                                                       follow_redirects,
+                                                       ignore_proxies,
+                                                       verify)
+        else:
+            (status_headers, stream) = self.fetch_local_file(url)
+
+        if timestamp is None:
+            timestamp = timestamp_now()
+
+        cdx = {'urlkey': urlkey,
+               'timestamp': timestamp,
+               'url': url,
+               'status': status_headers.get_statuscode(),
+               'mime': status_headers.get_header('Content-Type'),
+               'is_live': True,
+              }
+
+        result = (self.rewriter.
+                  rewrite_content(urlrewriter,
+                                  status_headers,
+                                  stream,
+                                  head_insert_func=head_insert_func,
+                                  urlkey=urlkey,
+                                  cdx=cdx))
+
+        if env:
+            env['pywb.cdx'] = cdx
+
+        return result
+
+    def get_rewritten(self, *args, **kwargs):
+        result = self.fetch_request(*args, **kwargs)
+
+        status_headers, gen, is_rewritten = result
+
+        buff = ''.join(gen)
+
+        return (status_headers, buff)

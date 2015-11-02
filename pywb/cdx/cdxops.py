@@ -1,6 +1,10 @@
 from cdxobject import CDXObject, IDXObject
+from cdxobject import TIMESTAMP, STATUSCODE, MIMETYPE, DIGEST
+from cdxobject import OFFSET, LENGTH, FILENAME
+
 from query import CDXQuery
-from pywb.utils.timeutils import timestamp_to_sec
+from pywb.utils.timeutils import timestamp_to_sec, pad_timestamp
+from pywb.utils.timeutils import PAD_14_DOWN, PAD_14_UP
 
 import bisect
 import itertools
@@ -20,6 +24,11 @@ def cdx_load(sources, query, process=True):
     :param process: bool, perform processing sorting/filtering/grouping ops
     """
     cdx_iter = create_merged_cdx_gen(sources, query)
+
+    # page count is a special case, no further processing
+    if query.page_count:
+        return cdx_iter
+
     cdx_iter = make_obj_iter(cdx_iter, query)
 
     if process and not query.secondary_index_only:
@@ -31,6 +40,8 @@ def cdx_load(sources, query, process=True):
 
     if query.output == 'text':
         cdx_iter = cdx_to_text(cdx_iter, query.fields)
+    elif query.output == 'json':
+        cdx_iter = cdx_to_json(cdx_iter, query.fields)
 
     return cdx_iter
 
@@ -42,6 +53,12 @@ def cdx_to_text(cdx_iter, fields):
 
 
 #=================================================================
+def cdx_to_json(cdx_iter, fields):
+    for cdx in cdx_iter:
+        yield cdx.to_json(fields)
+
+
+#=================================================================
 def process_cdx(cdx_iter, query):
     if query.resolve_revisits:
         cdx_iter = cdx_resolve_revisits(cdx_iter)
@@ -49,6 +66,9 @@ def process_cdx(cdx_iter, query):
     filters = query.filters
     if filters:
         cdx_iter = cdx_filter(cdx_iter, filters)
+
+    if query.from_ts or query.to_ts:
+        cdx_iter = cdx_clamp(cdx_iter, query.from_ts, query.to_ts)
 
     collapse_time = query.collapse_time
     if collapse_time:
@@ -169,9 +189,11 @@ def cdx_filter(cdx_iter, filter_strings):
             # no field set, apply filter to entire cdx
             if len(parts) == 1:
                 self.field = ''
-            else:
             # apply filter to cdx[field]
+            else:
                 self.field = parts[0]
+                self.field = CDXObject.CDX_ALT_FIELDS.get(self.field,
+                                                          self.field)
                 string = parts[1]
 
             # make regex if regex mode
@@ -181,7 +203,10 @@ def cdx_filter(cdx_iter, filter_strings):
                 self.filter_str = string
 
         def __call__(self, cdx):
-            val = cdx[self.field] if self.field else str(cdx)
+            if not self.field:
+                val = str(cdx)
+            else:
+                val = cdx.get(self.field, '')
 
             matched = self.compare_func(val)
 
@@ -204,6 +229,27 @@ def cdx_filter(cdx_iter, filter_strings):
 
 
 #=================================================================
+def cdx_clamp(cdx_iter, from_ts, to_ts):
+    """
+    Clamp by start and end ts
+    """
+    if from_ts and len(from_ts) < 14:
+        from_ts = pad_timestamp(from_ts, PAD_14_DOWN)
+
+    if to_ts and len(to_ts) < 14:
+        to_ts = pad_timestamp(to_ts, PAD_14_UP)
+
+    for cdx in cdx_iter:
+        if from_ts and cdx[TIMESTAMP] < from_ts:
+            continue
+
+        if to_ts and cdx[TIMESTAMP] > to_ts:
+            continue
+
+        yield cdx
+
+
+#=================================================================
 def cdx_collapse_time_status(cdx_iter, timelen=10):
     """
     collapse by timestamp and status code.
@@ -213,7 +259,7 @@ def cdx_collapse_time_status(cdx_iter, timelen=10):
     last_token = None
 
     for cdx in cdx_iter:
-        curr_token = (cdx['timestamp'][:timelen], cdx['statuscode'])
+        curr_token = (cdx[TIMESTAMP][:timelen], cdx.get(STATUSCODE, ''))
 
         # yield if last_dedup_time is diff, otherwise skip
         if curr_token != last_token:
@@ -231,7 +277,7 @@ def cdx_sort_closest(closest, cdx_iter, limit=10):
     closest_sec = timestamp_to_sec(closest)
 
     for cdx in cdx_iter:
-        sec = timestamp_to_sec(cdx['timestamp'])
+        sec = timestamp_to_sec(cdx[TIMESTAMP])
         key = abs(closest_sec - sec)
 
         # create tuple to sort by key
@@ -253,7 +299,7 @@ def cdx_sort_closest(closest, cdx_iter, limit=10):
 # resolve revisits
 
 # Fields to append from cdx original to revisit
-ORIG_TUPLE = ['length', 'offset', 'filename']
+ORIG_TUPLE = [LENGTH, OFFSET, FILENAME]
 
 
 def cdx_resolve_revisits(cdx_iter):
@@ -270,18 +316,24 @@ def cdx_resolve_revisits(cdx_iter):
     for cdx in cdx_iter:
         is_revisit = cdx.is_revisit()
 
-        digest = cdx['digest']
+        digest = cdx.get(DIGEST)
 
-        original_cdx = originals.get(digest)
+        original_cdx = None
 
-        if not original_cdx and not is_revisit:
-            originals[digest] = cdx
+        # only set if digest is valid, otherwise no way to resolve
+        if digest:
+            original_cdx = originals.get(digest)
+
+            if not original_cdx and not is_revisit:
+                originals[digest] = cdx
 
         if original_cdx and is_revisit:
-            fill_orig = lambda field: original_cdx[field]
+            fill_orig = lambda field: original_cdx.get(field, '-')
             # Transfer mimetype and statuscode
-            cdx['mimetype'] = original_cdx['mimetype']
-            cdx['statuscode'] = original_cdx['statuscode']
+            if MIMETYPE in cdx:
+                cdx[MIMETYPE] = original_cdx.get(MIMETYPE, '')
+            if STATUSCODE in cdx:
+                cdx[STATUSCODE] = original_cdx.get(STATUSCODE, '')
         else:
             fill_orig = lambda field: '-'
 

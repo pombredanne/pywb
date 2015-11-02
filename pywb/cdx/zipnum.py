@@ -4,14 +4,14 @@ import itertools
 import logging
 from io import BytesIO
 import datetime
+import json
 
 from cdxsource import CDXSource
-from cdxobject import IDXObject
+from cdxobject import IDXObject, CDXException
 
-from pywb.utils.loaders import BlockLoader
-from pywb.utils.loaders import SeekableTextFileReader
+from pywb.utils.loaders import BlockLoader, read_last_line
 from pywb.utils.bufferedreaders import gzip_decompressor
-from pywb.utils.binsearch import iter_range, linearsearch
+from pywb.utils.binsearch import iter_range, linearsearch, search
 
 
 #=================================================================
@@ -24,56 +24,23 @@ class ZipBlocks:
 
 
 #=================================================================
-def readline_to_iter(stream):
-    try:
-        count = 0
-        buff = stream.readline()
-        while buff:
-            count += 1
-            yield buff
-            buff = stream.readline()
+#TODO: see if these could be combined with warc path resolvers
 
-    finally:
-        stream.close()
-
-
-#=================================================================
-class ZipNumCluster(CDXSource):
-    DEFAULT_RELOAD_INTERVAL = 10  # in minutes
-    DEFAULT_MAX_BLOCKS = 50
-
-    def __init__(self, summary, config=None):
-
-        loc = None
-        cookie_maker = None
-        self.max_blocks = self.DEFAULT_MAX_BLOCKS
-        reload_ival = self.DEFAULT_RELOAD_INTERVAL
-
-        if config:
-            loc = config.get('zipnum_loc')
-            cookie_maker = config.get('cookie_maker')
-
-            self.max_blocks = config.get('max_blocks', self.max_blocks)
-
-            reload_ival = config.get('reload_interval', reload_ival)
-
-        if not loc:
-            splits = os.path.splitext(summary)
-            loc = splits[0] + '.loc'
-
-        self.summary = summary
-        self.loc_filename = loc
-
+class LocMapResolver(object):
+    """ Lookup shards based on a file mapping
+    shard name to one or more paths. The entries are
+    tab delimited.
+    """
+    def __init__(self, loc_summary, loc_filename):
         # initial loc map
         self.loc_map = {}
         self.loc_mtime = 0
+        if not loc_filename:
+            splits = os.path.splitext(loc_summary)
+            loc_filename = splits[0] + '.loc'
+        self.loc_filename = loc_filename
+
         self.load_loc()
-
-        # reload interval
-        self.loc_update_time = datetime.datetime.now()
-        self.reload_interval = datetime.timedelta(minutes=reload_ival)
-
-        self.blk_loader = BlockLoader(cookie_maker=cookie_maker)
 
     def load_loc(self):
         # check modified time of current file before loading
@@ -85,10 +52,69 @@ class ZipNumCluster(CDXSource):
         self.loc_mtime = new_mtime
 
         logging.debug('Loading loc from: ' + self.loc_filename)
-        with open(self.loc_filename) as fh:
+        with open(self.loc_filename, 'rb') as fh:
             for line in fh:
                 parts = line.rstrip().split('\t')
                 self.loc_map[parts[0]] = parts[1:]
+
+    def __call__(self, part, query):
+        return self.loc_map[part]
+
+
+#=================================================================
+class LocPrefixResolver(object):
+    """ Use a prefix lookup, where the prefix can either be a fixed
+    string or can be a regex replacement of the index summary path
+    """
+    def __init__(self, loc_summary, loc_config):
+        import re
+        loc_match = loc_config.get('match', '().*')
+        loc_replace = loc_config['replace']
+        loc_summary = os.path.dirname(loc_summary) + '/'
+        self.prefix = re.sub(loc_match, loc_replace, loc_summary)
+
+    def load_loc(self):
+        pass
+
+    def __call__(self, part, query):
+        return [self.prefix + part]
+
+
+#=================================================================
+class ZipNumCluster(CDXSource):
+    DEFAULT_RELOAD_INTERVAL = 10  # in minutes
+    DEFAULT_MAX_BLOCKS = 10
+
+    def __init__(self, summary, config=None):
+        self.max_blocks = self.DEFAULT_MAX_BLOCKS
+
+        self.loc_resolver = None
+
+        loc = None
+        cookie_maker = None
+        reload_ival = self.DEFAULT_RELOAD_INTERVAL
+
+        if config:
+            loc = config.get('shard_index_loc')
+            cookie_maker = config.get('cookie_maker')
+
+            self.max_blocks = config.get('max_blocks', self.max_blocks)
+
+            reload_ival = config.get('reload_interval', reload_ival)
+
+
+        if isinstance(loc, dict):
+            self.loc_resolver = LocPrefixResolver(summary, loc)
+        else:
+            self.loc_resolver = LocMapResolver(summary, loc)
+
+        self.summary = summary
+
+        # reload interval
+        self.loc_update_time = datetime.datetime.now()
+        self.reload_interval = datetime.timedelta(minutes=reload_ival)
+
+        self.blk_loader = BlockLoader(cookie_maker=cookie_maker)
 
 #    @staticmethod
 #    def reload_timed(timestamp, val, delta, func):
@@ -107,30 +133,129 @@ class ZipNumCluster(CDXSource):
 #        if reload_time:
 #            self.loc_update_time = reload_time
 
-    def lookup_loc(self, part):
-        return self.loc_map[part]
-
     def load_cdx(self, query):
-        self.load_loc()
+        self.loc_resolver.load_loc()
+        return self._do_load_cdx(self.summary, query)
 
-        reader = SeekableTextFileReader(self.summary)
+    def _do_load_cdx(self, filename, query):
+        reader = open(filename, 'rb')
 
-        idx_iter = iter_range(reader,
-                              query.key,
-                              query.end_key,
-                              prev_size=1)
+        idx_iter = self.compute_page_range(reader, query)
 
-        if query.secondary_index_only:
+        if query.secondary_index_only or query.page_count:
             return idx_iter
+
+        blocks = self.idx_to_cdx(idx_iter, query)
+
+        def gen_cdx():
+            for blk in blocks:
+                for cdx in blk:
+                    yield cdx
+
+        return gen_cdx()
+
+
+    def _page_info(self, pages, pagesize, blocks):
+        info = dict(pages=pages,
+                    pageSize=pagesize,
+                    blocks=blocks)
+        return json.dumps(info) + '\n'
+
+    def compute_page_range(self, reader, query):
+        pagesize = query.page_size
+        if not pagesize:
+            pagesize = self.max_blocks
         else:
-            blocks = self.idx_to_cdx(idx_iter, query)
+            pagesize = int(pagesize)
 
-            def gen_cdx():
-                for blk in blocks:
-                    for cdx in blk:
-                        yield cdx
+        last_line = None
 
-            return gen_cdx()
+        # Get End
+        end_iter = search(reader, query.end_key, prev_size=1)
+
+        try:
+            end_line = end_iter.next()
+        except StopIteration:
+            last_line = read_last_line(reader)
+            end_line = last_line
+
+        # Get Start
+        first_iter = iter_range(reader,
+                                query.key,
+                                query.end_key,
+                                prev_size=1)
+
+        try:
+            first_line = first_iter.next()
+        except StopIteration:
+            if end_line == last_line and query.key >= last_line:
+                first_line = last_line
+            else:
+                reader.close()
+                if query.page_count:
+                    yield self._page_info(0, pagesize, 0)
+                    return
+                else:
+                    raise
+
+        first = IDXObject(first_line)
+
+        end = IDXObject(end_line)
+
+        try:
+            blocks = end['lineno'] - first['lineno']
+            total_pages = blocks / pagesize + 1
+        except:
+            blocks = -1
+            total_pages = 1
+
+        if query.page_count:
+            # same line, so actually need to look at cdx
+            # to determine if it exists
+            if blocks == 0:
+                try:
+                    block_cdx_iter = self.idx_to_cdx([first_line], query)
+                    block = block_cdx_iter.next()
+                    cdx = block.next()
+                except StopIteration:
+                    total_pages = 0
+                    blocks = -1
+
+            yield self._page_info(total_pages, pagesize, blocks + 1)
+            reader.close()
+            return
+
+        curr_page = query.page
+        if curr_page >= total_pages or curr_page < 0:
+            msg = 'Page {0} invalid: First Page is 0, Last Page is {1}'
+            reader.close()
+            raise CDXException(msg.format(curr_page, total_pages - 1))
+
+        startline = curr_page * pagesize
+        endline = startline + pagesize - 1
+        if blocks >= 0:
+            endline = min(endline, blocks)
+
+        if curr_page == 0:
+            yield first_line
+        else:
+            startline -= 1
+
+        idxiter = itertools.islice(first_iter, startline, endline)
+        for idx in idxiter:
+            yield idx
+
+        reader.close()
+
+
+    def search_by_line_num(self, reader, line):  # pragma: no cover
+        def line_cmp(line1, line2):
+            line1_no = int(line1.rsplit('\t', 1)[-1])
+            line2_no = int(line2.rsplit('\t', 1)[-1])
+            return cmp(line1_no, line2_no)
+
+        line_iter = search(reader, line, compare_func=line_cmp)
+        yield line_iter.next()
 
     def idx_to_cdx(self, idx_iter, query):
         blocks = None
@@ -165,7 +290,12 @@ class ZipNumCluster(CDXSource):
         last_exc = None
         last_traceback = None
 
-        for location in self.lookup_loc(blocks.part):
+        try:
+            locations = self.loc_resolver(blocks.part, query)
+        except:
+            raise Exception('No Locations Found for: ' + blocks.part)
+
+        for location in self.loc_resolver(blocks.part, query):
             try:
                 return self.load_blocks(location, blocks, ranges, query)
             except Exception as exc:
@@ -174,11 +304,15 @@ class ZipNumCluster(CDXSource):
                 last_traceback = sys.exc_info()[2]
 
         if last_exc:
-            raise exc, None, last_traceback
+            raise last_exc, None, last_traceback
         else:
-            raise Exception('No Locations Found for: ' + block.part)
+            raise Exception('No Locations Found for: ' + blocks.part)
 
     def load_blocks(self, location, blocks, ranges, query):
+        """ Load one or more blocks of compressed cdx lines, return
+        a line iterator which decompresses and returns one line at a time,
+        bounded by query.key and query.end_key
+        """
 
         if (logging.getLogger().getEffectiveLevel() <= logging.DEBUG):
             msg = 'Loading {b.count} blocks from {loc}:{b.offset}+{b.length}'
@@ -189,7 +323,8 @@ class ZipNumCluster(CDXSource):
         def decompress_block(range_):
             decomp = gzip_decompressor()
             buff = decomp.decompress(reader.read(range_))
-            return readline_to_iter(BytesIO(buff))
+            for line in BytesIO(buff):
+                yield line
 
         iter_ = itertools.chain(*itertools.imap(decompress_block, ranges))
 
@@ -200,3 +335,7 @@ class ZipNumCluster(CDXSource):
         end = query.end_key
         iter_ = itertools.takewhile(lambda line: line < end, iter_)
         return iter_
+
+    def __str__(self):
+        return 'ZipNum Cluster: {0}, {1}'.format(self.summary,
+                                                 self.loc_resolver)

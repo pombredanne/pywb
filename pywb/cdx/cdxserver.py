@@ -1,9 +1,10 @@
 from pywb.utils.canonicalize import UrlCanonicalizer, calc_search_range
+from pywb.utils.wbexception import NotFoundException
 
 from cdxops import cdx_load
 from cdxsource import CDXSource, CDXFile, RemoteCDXSource, RedisCDXSource
 from zipnum import ZipNumCluster
-from cdxobject import CDXObject, CaptureNotFoundException, CDXException
+from cdxobject import CDXObject, CDXException
 from query import CDXQuery
 from cdxdomainspecific import load_domain_specific_cdx_rules
 
@@ -34,14 +35,11 @@ class BaseCDXServer(object):
         if not self.url_canon:
             self.url_canon = UrlCanonicalizer(surt_ordered)
 
-        # set perms checker, if any
-        #self.perms_checker = kwargs.get('perms_checker')
-
     def _check_cdx_iter(self, cdx_iter, query):
         """ Check cdx iter semantics
         If `cdx_iter` is empty (no matches), check if fuzzy matching
         is allowed, and try it -- otherwise,
-        throw :exc:`~pywb.cdx.cdxobject.CaptureNotFoundException`
+        throw :exc:`~pywb.utils.wbexception.NotFoundException`
         """
 
         cdx_iter = self.peek_iter(cdx_iter)
@@ -57,15 +55,31 @@ class BaseCDXServer(object):
 
             fuzzy_query_params = self.fuzzy_query(query)
             if fuzzy_query_params:
-                return self.load_cdx_query(fuzzy_query_params)
+                return self.load_cdx(**fuzzy_query_params)
 
         msg = 'No Captures found for: ' + query.url
-        raise CaptureNotFoundException(msg)
+        if not query.is_exact:
+            msg += ' (' + query.match_type + ' query)'
+
+        raise NotFoundException(msg, url=query.url)
+
+    def _calc_search_keys(self, query):
+        return calc_search_range(url=query.url,
+                                 match_type=query.match_type,
+                                 url_canon=self.url_canon)
 
     def load_cdx(self, **params):
-        return self.load_cdx_query(CDXQuery(**params))
+        query = CDXQuery(**params)
 
-    def load_cdx_query(self, query):
+        key, end_key = self._calc_search_keys(query)
+
+        query.set_key(key, end_key)
+
+        cdx_iter = self._load_cdx_query(query)
+
+        return self._check_cdx_iter(cdx_iter, query)
+
+    def _load_cdx_query(self, query):  # pragma: no cover
         raise NotImplementedError('Implement in subclass')
 
     @staticmethod
@@ -92,31 +106,21 @@ class CDXServer(BaseCDXServer):
         # config argument.
         self._create_cdx_sources(paths, kwargs.get('config'))
 
-    def load_cdx_query(self, query):
+    def _load_cdx_query(self, query):
         """
         load CDX for query parameters ``params``.
         ``key`` (or ``url``) parameter specifies URL to query,
         ``matchType`` parameter specifies matching method for ``key``
         (default ``exact``).
         other parameters are passed down to :func:`cdx_load`.
-        raises :exc:`~pywb.cdx.cdxobject.CaptureNotFoundException`
+        raises :exc:`~pywb.utils.wbexception.NotFoundException`
         if no captures are found.
 
         :param query: query parameters
         :type query: :class:`~pywb.cdx.query.CDXQuery`
         :rtype: iterator on :class:`~pywb.cdx.cdxobject.CDXObject`
         """
-        url = query.url
-        key, end_key = calc_search_range(url=url,
-                                         match_type=query.match_type,
-                                         url_canon=self.url_canon)
-        query.set_key(key, end_key)
-
-        cdx_iter = cdx_load(self.sources,
-                            query)
-                            #perms_checker=self.perms_checker)
-
-        return self._check_cdx_iter(cdx_iter, query)
+        return cdx_load(self.sources, query)
 
     def _create_cdx_sources(self, paths, config):
         """
@@ -147,9 +151,6 @@ class CDXServer(BaseCDXServer):
         self.sources.append(source)
 
     def add_cdx_source(self, source, config):
-        if source is None:
-            return
-
         if isinstance(source, CDXSource):
             self._add_cdx_source(source)
 
@@ -157,10 +158,10 @@ class CDXServer(BaseCDXServer):
             if os.path.isdir(source):
                 for fn in os.listdir(source):
                     self._add_cdx_source(self._create_cdx_source(
-                            os.path.join(source, fn), config))
+                        os.path.join(source, fn), config))
             else:
                 self._add_cdx_source(self._create_cdx_source(
-                        source, config))
+                    source, config))
 
     def _create_cdx_source(self, filename, config):
         if is_http(filename):
@@ -169,17 +170,17 @@ class CDXServer(BaseCDXServer):
         if filename.startswith('redis://'):
             return RedisCDXSource(filename, config)
 
-        if filename.endswith('.cdx'):
+        if filename.endswith(('.cdx', '.cdxj')):
             return CDXFile(filename)
 
         if filename.endswith(('.summary', '.idx')):
             return ZipNumCluster(filename, config)
 
-        logging.warn('skipping unrecognized URI:%s', filename)
-        return None
+        # no warning for .loc
+        if not filename.endswith('.loc'):
+            logging.warn('skipping unrecognized URI: %s', filename)
 
-    def __str__(self):
-        return 'CDX server serving from ' + str(self.sources)
+        return None
 
 
 #=================================================================
@@ -200,16 +201,12 @@ class RemoteCDXServer(BaseCDXServer):
         else:
             raise Exception('Invalid remote cdx source: ' + str(source))
 
-    def load_cdx_query(self, query):
-        remote_iter = cdx_load([self.source], query, process=False)
-        return self._check_cdx_iter(remote_iter, query)
-
-    def __str__(self):
-        return 'Remote CDX server serving from ' + str(self.sources[0])
+    def _load_cdx_query(self, query):
+        return cdx_load([self.source], query, process=False)
 
 
 #=================================================================
-def create_cdx_server(config, ds_rules_file=None):
+def create_cdx_server(config, ds_rules_file=None, server_cls=None):
     if hasattr(config, 'get'):
         paths = config.get('index_paths')
         surt_ordered = config.get('surt_ordered', True)
@@ -221,10 +218,12 @@ def create_cdx_server(config, ds_rules_file=None):
 
     logging.debug('CDX Surt-Ordered? ' + str(surt_ordered))
 
-    if isinstance(paths, str) and is_http(paths):
-        server_cls = RemoteCDXServer
-    else:
-        server_cls = CDXServer
+    if not server_cls:
+        if ((isinstance(paths, str) and is_http(paths)) or
+            isinstance(paths, RemoteCDXSource)):
+            server_cls = RemoteCDXServer
+        else:
+            server_cls = CDXServer
 
     return server_cls(paths,
                       config=pass_config,

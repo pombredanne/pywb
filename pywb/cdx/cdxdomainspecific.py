@@ -2,6 +2,7 @@ import yaml
 import re
 import logging
 import pkg_resources
+import urlparse
 
 from pywb.utils.dsrules import BaseRule, RuleSet
 
@@ -12,11 +13,6 @@ from query import CDXQuery
 
 #=================================================================
 def load_domain_specific_cdx_rules(ds_rules_file, surt_ordered):
-    """
-    >>> (canon, fuzzy) = load_domain_specific_cdx_rules(None, True)
-    >>> canon('http://test.example.example/path/index.html?a=b&id=value&c=d')
-    'example,example,test)/path/index.html?id=value'
-    """
     canon = None
     fuzzy = None
 
@@ -25,7 +21,7 @@ def load_domain_specific_cdx_rules(ds_rules_file, surt_ordered):
                     ds_rules_file=ds_rules_file)
 
     if not surt_ordered:
-        for rule in rules:
+        for rule in rules.rules:
             rule.unsurt()
 
     if rules:
@@ -36,7 +32,7 @@ def load_domain_specific_cdx_rules(ds_rules_file, surt_ordered):
                     ds_rules_file=ds_rules_file)
 
     if not surt_ordered:
-        for rule in rules:
+        for rule in rules.rules:
             rule.unsurt()
 
     if rules:
@@ -87,8 +83,10 @@ class FuzzyQuery:
 
             matched_rule = rule
 
-            if len(m.groups()) == 1:
-                filter_.append('~urlkey:' + m.group(1))
+            groups = m.groups()
+            for g in groups:
+                for f in matched_rule.filter:
+                    filter_.append(f.format(g))
 
             break
 
@@ -99,29 +97,50 @@ class FuzzyQuery:
         if matched_rule.replace:
             repl = matched_rule.replace
 
-        inx = url.rfind(repl)
+        inx = url.find(repl)
         if inx > 0:
-            url = url[:inx + 1]
+            url = url[:inx + len(repl)]
 
-        params = {'url': url,
-                  'matchType': 'prefix',
-                  'filter': filter_,
-                  'output': output}
+        if matched_rule.match_type == 'domain':
+            host = urlparse.urlsplit(url).netloc
+            # remove the subdomain
+            url = host.split('.', 1)[1]
 
-        return CDXQuery(**params)
+        params = query.params
+        params.update({'url': url,
+                       'matchType': matched_rule.match_type,
+                       'filter': filter_})
+
+        if 'reverse' in params:
+            del params['reverse']
+
+        if 'closest' in params:
+            del params['closest']
+
+        if 'end_key' in params:
+            del params['end_key']
+
+        return params
 
 
 #=================================================================
 class CDXDomainSpecificRule(BaseRule):
+    DEFAULT_FILTER = ['~urlkey:{0}']
+    DEFAULT_MATCH_TYPE = 'prefix'
+
     def __init__(self, name, config):
         super(CDXDomainSpecificRule, self).__init__(name, config)
 
-        if isinstance(config, basestring):
-            self.regex = re.compile(config)
+        if not isinstance(config, dict):
+            self.regex = self.make_regex(config)
             self.replace = None
+            self.filter = self.DEFAULT_FILTER
+            self.match_type = self.DEFAULT_MATCH_TYPE
         else:
-            self.regex = re.compile(config.get('match'))
+            self.regex = self.make_regex(config.get('match'))
             self.replace = config.get('replace')
+            self.filter = config.get('filter', self.DEFAULT_FILTER)
+            self.match_type = config.get('type', self.DEFAULT_MATCH_TYPE)
 
     def unsurt(self):
         """
@@ -131,12 +150,36 @@ class CDXDomainSpecificRule(BaseRule):
         """
         self.url_prefix = map(unsurt, self.url_prefix)
         if self.regex:
-            self.regex = unsurt(self.regex)
+            self.regex = re.compile(unsurt(self.regex.pattern))
 
         if self.replace:
             self.replace = unsurt(self.replace)
 
+    @staticmethod
+    def make_regex(config):
+        # just query args
+        if isinstance(config, list):
+            string = CDXDomainSpecificRule.make_query_match_regex(config)
 
-if __name__ == "__main__":
-        import doctest
-        doctest.testmod()
+        # split out base and args
+        elif isinstance(config, dict):
+            string = config.get('regex', '')
+            string += CDXDomainSpecificRule.make_query_match_regex(
+                      config.get('args', []))
+
+        # else assume string
+        else:
+            string = str(config)
+
+        return re.compile(string)
+
+    @staticmethod
+    def make_query_match_regex(params_list):
+        params_list.sort()
+
+        def conv(value):
+            return '[?&]({0}=[^&]+)'.format(re.escape(value))
+
+        params_list = map(conv, params_list)
+        final_str = '.*'.join(params_list)
+        return final_str

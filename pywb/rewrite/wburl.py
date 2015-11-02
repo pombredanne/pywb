@@ -39,8 +39,8 @@ wayback url format.
 """
 
 import re
-import rfc3987
-
+import urllib
+import urlparse
 
 #=================================================================
 class BaseWbUrl(object):
@@ -48,7 +48,6 @@ class BaseWbUrl(object):
     URL_QUERY = 'url_query'
     REPLAY = 'replay'
     LATEST_REPLAY = 'latest_replay'
-
 
     def __init__(self, url='', mod='',
                  timestamp='', end_timestamp='', type=None):
@@ -59,121 +58,151 @@ class BaseWbUrl(object):
         self.mod = mod
         self.type = type
 
+    def is_replay(self):
+        return self.is_replay_type(self.type)
+
+    def is_latest_replay(self):
+        return (self.type == BaseWbUrl.LATEST_REPLAY)
+
+    def is_query(self):
+        return self.is_query_type(self.type)
+
+    def is_url_query(self):
+        return (self.type == BaseWbUrl.URL_QUERY)
+
+    @staticmethod
+    def is_replay_type(type_):
+        return (type_ == BaseWbUrl.REPLAY or
+                type_ == BaseWbUrl.LATEST_REPLAY)
+
+    @staticmethod
+    def is_query_type(type_):
+        return (type_ == BaseWbUrl.QUERY or
+                type_ == BaseWbUrl.URL_QUERY)
+
 
 #=================================================================
 class WbUrl(BaseWbUrl):
-    """
-    # Replay Urls
-    # ======================
-    >>> repr(WbUrl('20131010000506/example.com'))
-    "('replay', '20131010000506', '', 'http://example.com', '20131010000506/http://example.com')"
-
-    >>> repr(WbUrl('20130102im_/https://example.com'))
-    "('replay', '20130102', 'im_', 'https://example.com', '20130102im_/https://example.com')"
-
-    >>> repr(WbUrl('20130102im_/https:/example.com'))
-    "('replay', '20130102', 'im_', 'https://example.com', '20130102im_/https://example.com')"
-
-    # Protocol agnostic convert to http
-    >>> repr(WbUrl('20130102im_///example.com'))
-    "('replay', '20130102', 'im_', 'http://example.com', '20130102im_/http://example.com')"
-
-    >>> repr(WbUrl('cs_/example.com'))
-    "('latest_replay', '', 'cs_', 'http://example.com', 'cs_/http://example.com')"
-
-    >>> repr(WbUrl('https://example.com/xyz'))
-    "('latest_replay', '', '', 'https://example.com/xyz', 'https://example.com/xyz')"
-
-    >>> repr(WbUrl('https:/example.com/xyz'))
-    "('latest_replay', '', '', 'https://example.com/xyz', 'https://example.com/xyz')"
-
-    >>> repr(WbUrl('https://example.com/xyz?a=%2f&b=%2E'))
-    "('latest_replay', '', '', 'https://example.com/xyz?a=%2f&b=%2E', 'https://example.com/xyz?a=%2f&b=%2E')"
-
-    # Query Urls
-    # ======================
-    >>> repr(WbUrl('*/http://example.com/abc?def=a'))
-    "('query', '', '', 'http://example.com/abc?def=a', '*/http://example.com/abc?def=a')"
-
-    >>> repr(WbUrl('*/http://example.com/abc?def=a*'))
-    "('url_query', '', '', 'http://example.com/abc?def=a', '*/http://example.com/abc?def=a*')"
-
-    >>> repr(WbUrl('2010*/http://example.com/abc?def=a'))
-    "('query', '2010', '', 'http://example.com/abc?def=a', '2010*/http://example.com/abc?def=a')"
-
-    # timestamp range query
-    >>> repr(WbUrl('2009-2015*/http://example.com/abc?def=a'))
-    "('query', '2009', '', 'http://example.com/abc?def=a', '2009-2015*/http://example.com/abc?def=a')"
-
-    >>> repr(WbUrl('json/*/http://example.com/abc?def=a'))
-    "('query', '', 'json', 'http://example.com/abc?def=a', 'json/*/http://example.com/abc?def=a')"
-
-    >>> repr(WbUrl('timemap-link/2011*/http://example.com/abc?def=a'))
-    "('query', '2011', 'timemap-link', 'http://example.com/abc?def=a', 'timemap-link/2011*/http://example.com/abc?def=a')"
-
-    # strip off repeated, likely scheme-agnostic, slashes altogether
-    >>> repr(WbUrl('///example.com'))
-    "('latest_replay', '', '', 'http://example.com', 'http://example.com')"
-
-    >>> repr(WbUrl('//example.com/'))
-    "('latest_replay', '', '', 'http://example.com/', 'http://example.com/')"
-
-    >>> repr(WbUrl('/example.com/'))
-    "('latest_replay', '', '', 'http://example.com/', 'http://example.com/')"
-
-
-    # Error Urls
-    # ======================
-    >>> x = WbUrl('/#$%#/')
-    Traceback (most recent call last):
-    Exception: Bad Request Url: http://#$%#/
-
-    >>> x = WbUrl('/http://example.com:abc/')
-    Traceback (most recent call last):
-    Exception: Bad Request Url: http://example.com:abc/
-
-    # considered blank
-    >>> x = WbUrl('https:/')
-    >>> x = WbUrl('https:///')
-    >>> x = WbUrl('http://')
-    """
-
     # Regexs
     # ======================
-    QUERY_REGEX = re.compile('^(?:([\w\-:]+)/)?(\d*)(?:-(\d+))?\*/?(.*)$')
-    REPLAY_REGEX = re.compile('^(\d*)([a-z]+_)?/{0,3}(.*)$')
+    QUERY_REGEX = re.compile('^(?:([\w\-:]+)/)?(\d*)[*-](\d*)/?(.+)$')
+    REPLAY_REGEX = re.compile('^(\d*)([a-z]+_)?/{1,3}(.+)$')
+    #LATEST_REPLAY_REGEX = re.compile('^\w_)')
 
     DEFAULT_SCHEME = 'http://'
+
+    FIRST_PATH = re.compile('(?<![:/])[/?](?![/])')
+
+
+    @staticmethod
+    def percent_encode_host(url):
+        """ Convert the host of uri formatted with to_uri()
+        to have a %-encoded host instead of punycode host
+        The rest of url should be unchanged
+        """
+
+        # only continue if punycode encoded
+        if 'xn--' not in url:
+            return url
+
+        parts = urlparse.urlsplit(url)
+        domain = parts.netloc
+        try:
+            domain = domain.decode('idna')
+            domain = domain.encode('utf-8', 'ignore')
+        except:
+            # likely already encoded, so use as is
+            pass
+
+        domain = urllib.quote(domain)#, safe=r':\/')
+
+        return urlparse.urlunsplit((parts[0], domain, parts[2], parts[3], parts[4]))
+
+
+    @staticmethod
+    def to_uri(url):
+        """ Converts a url to an ascii %-encoded form
+        where:
+        - scheme is ascii,
+        - host is punycode,
+        - and remainder is %-encoded
+        Not using urlsplit to also decode partially encoded
+        scheme urls
+        """
+        parts = WbUrl.FIRST_PATH.split(url, 1)
+
+        scheme_dom = urllib.unquote_plus(parts[0])
+
+        if isinstance(scheme_dom, str):
+            if scheme_dom == parts[0]:
+                return url
+
+            scheme_dom = scheme_dom.decode('utf-8', 'ignore')
+
+        scheme_dom = scheme_dom.rsplit('/', 1)
+        domain = scheme_dom[-1]
+
+        try:
+            domain = domain.encode('idna')
+        except UnicodeError:
+            # the url is invalid and this is probably not a domain
+            pass
+
+        if len(scheme_dom) > 1:
+            url = scheme_dom[0].encode('utf-8') + '/' + domain
+        else:
+            url = domain
+
+        if len(parts) > 1:
+            if isinstance(parts[1], unicode):
+                url += '/' + urllib.quote(parts[1].encode('utf-8'))
+            else:
+                url += '/' + parts[1]
+
+        return url
+
     # ======================
 
-
-    def __init__(self, url):
+    def __init__(self, orig_url):
         super(WbUrl, self).__init__()
 
-        self.original_url = url
+        if isinstance(orig_url, unicode):
+            orig_url = orig_url.encode('utf-8')
+            orig_url = urllib.quote(orig_url)
 
-        if not any (f(url) for f in [self._init_query, self._init_replay]):
-            raise Exception('Invalid WbUrl: ', url)
+        self._original_url = orig_url
 
-        if len(self.url) == 0:
-            raise Exception('Invalid WbUrl: ', url)
+        if not self._init_query(orig_url):
+            if not self._init_replay(orig_url):
+                raise Exception('Invalid WbUrl: ', orig_url)
+
+        new_uri = WbUrl.to_uri(self.url)
+
+        self._do_percent_encode = True
+
+        self.url = new_uri
+
+        if self.url.startswith('urn:'):
+            return
 
         # protocol agnostic url -> http://
         # no protocol -> http://
         inx = self.url.find(':/')
+        #if inx < 0:
+            # check for other partially encoded variants
+        #    m = self.PARTIAL_ENC_RX.match(self.url)
+        #    if m:
+        #        len_ = len(m.group(0))
+        #        self.url = (urllib.unquote_plus(self.url[:len_]) +
+        #                    self.url[len_:])
+        #        inx = self.url.find(':/')
+
         if inx < 0:
             self.url = self.DEFAULT_SCHEME + self.url
         else:
             inx += 2
             if inx < len(self.url) and self.url[inx] != '/':
                 self.url = self.url[:inx] + '/' + self.url[inx:]
-
-        # BUG?: adding upper() because rfc3987 lib rejects lower case %-encoding
-        # %2F is fine, but %2f -- standard supports either
-        matcher = rfc3987.match(self.url.upper(), 'IRI')
-
-        if not matcher:
-            raise Exception('Bad Request Url: ' + self.url)
 
     # Match query regex
     # ======================
@@ -200,13 +229,21 @@ class WbUrl(BaseWbUrl):
     def _init_replay(self, url):
         replay = self.REPLAY_REGEX.match(url)
         if not replay:
-            return None
+            if not url:
+                return None
+
+            self.timestamp = ''
+            self.mod = ''
+            self.url = url
+            self.type = self.LATEST_REPLAY
+            return True
 
         res = replay.groups('')
 
         self.timestamp = res[0]
         self.mod = res[1]
         self.url = res[2]
+
         if self.timestamp:
             self.type = self.REPLAY
         else:
@@ -214,26 +251,62 @@ class WbUrl(BaseWbUrl):
 
         return True
 
+    def set_replay_timestamp(self, timestamp):
+        self.timestamp = timestamp
+        self.type = self.REPLAY
+
+    def deprefix_url(self, prefix):
+        rex_query = '=' + re.escape(prefix) + '([0-9])*([\w]{2}_)?/?'
+        self.url = re.sub(rex_query, '=', self.url)
+
+        rex_query = '=(' + urllib.quote_plus(prefix) + '.*?)((?:https?%3A)?%2F%2F[^&]+)'
+        self.url = re.sub(rex_query, '=\\2', self.url)
+
+        return self.url
+
+    def get_url(self, url=None):
+        if url is not None:
+            url = WbUrl.to_uri(url)
+        else:
+            url = self.url
+
+        if self._do_percent_encode:
+            url = WbUrl.percent_encode_host(url)
+
+        return url
+
+
     # Str Representation
     # ====================
     def to_str(self, **overrides):
-        atype = overrides['type'] if 'type' in overrides else self.type
-        mod = overrides['mod'] if 'mod' in overrides else self.mod
-        timestamp = overrides['timestamp'] if 'timestamp' in overrides else self.timestamp
-        end_timestamp = overrides['end_timestamp'] if 'end_timestamp' in overrides else self.end_timestamp
-        url = overrides['url'] if 'url' in overrides else self.url
+        type_ = overrides.get('type', self.type)
+        mod = overrides.get('mod', self.mod)
+        timestamp = overrides.get('timestamp', self.timestamp)
+        end_timestamp = overrides.get('end_timestamp', self.end_timestamp)
 
-        if atype == self.QUERY or atype == self.URL_QUERY:
+        url = self.get_url(overrides.get('url', self.url))
+
+        return self.to_wburl_str(url=url,
+                                 type=type_,
+                                 mod=mod,
+                                 timestamp=timestamp,
+                                 end_timestamp=end_timestamp)
+
+    @staticmethod
+    def to_wburl_str(url, type=BaseWbUrl.LATEST_REPLAY,
+                     mod='', timestamp='', end_timestamp=''):
+
+        if WbUrl.is_query_type(type):
             tsmod = ''
             if mod:
                 tsmod += mod + "/"
-            if timestamp:
-                tsmod += timestamp
-            if end_timestamp:
-                tsmod += '-' + end_timestamp
 
-            tsmod += "*/" + url
-            if atype == self.URL_QUERY:
+            tsmod += timestamp
+            tsmod += '*'
+            tsmod += end_timestamp
+
+            tsmod += "/" + url
+            if type == BaseWbUrl.URL_QUERY:
                 tsmod += "*"
             return tsmod
         else:
@@ -243,12 +316,21 @@ class WbUrl(BaseWbUrl):
             else:
                 return url
 
+    @property
+    def is_embed(self):
+        return (self.mod and
+                self.mod not in ('id_', 'mp_', 'tf_', 'bn_'))
+
+    @property
+    def is_banner_only(self):
+        return (self.mod == 'bn_')
+
+    @property
+    def is_identity(self):
+        return (self.mod == 'id_')
+
     def __str__(self):
         return self.to_str()
 
     def __repr__(self):
         return str((self.type, self.timestamp, self.mod, self.url, str(self)))
-
-if __name__ == "__main__":
-    import doctest
-    doctest.testmod()

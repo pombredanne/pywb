@@ -1,7 +1,9 @@
 import urlparse
 import re
+from urllib import quote
 
 from pywb.rewrite.url_rewriter import UrlRewriter
+from pywb.rewrite.wburl import WbUrl
 from wbrequestresponse import WbRequest, WbResponse
 
 
@@ -9,48 +11,103 @@ from wbrequestresponse import WbRequest, WbResponse
 # ArchivalRouter -- route WB requests in archival mode
 #=================================================================
 class ArchivalRouter(object):
-    def __init__(self, routes,
-                 hostpaths=None,
-                 port=None,
-                 abs_path=True,
-                 home_view=None,
-                 error_view=None):
-
+    def __init__(self, routes, **kwargs):
         self.routes = routes
 
         # optional port setting may be ignored by wsgi container
-        self.port = port
+        self.port = kwargs.get('port')
 
-        if hostpaths:
-            self.fallback = ReferRedirect(hostpaths)
-        else:
-            self.fallback = None
+        self.fallback = ReferRedirect()
 
-        self.abs_path = abs_path
+        self.abs_path = kwargs.get('abs_path')
 
-        self.home_view = home_view
-        self.error_view = error_view
+        self.home_view = kwargs.get('home_view')
+        self.error_view = kwargs.get('error_view')
+
+        self.urlrewriter_class = (kwargs.get('config', {}).
+                                  get('urlrewriter_class', UrlRewriter))
 
     def __call__(self, env):
+        request_uri = self.ensure_rel_uri_set(env)
+
         for route in self.routes:
-            result = route(env, self.abs_path)
-            if result:
-                return result
+            matcher, coll = route.is_handling(request_uri)
+            if matcher:
+                wbrequest = self.parse_request(route, env, matcher,
+                                               coll, request_uri,
+                                               use_abs_prefix=self.abs_path)
+
+                return route.handler(wbrequest)
 
         # Default Home Page
-        if env['REL_REQUEST_URI'] in ['/', '/index.html', '/index.htm']:
+        if request_uri in ['/', '/index.html', '/index.htm']:
             return self.render_home_page(env)
 
-        return self.fallback(env, self.routes) if self.fallback else None
+        return self.fallback(env, self) if self.fallback else None
+
+    def parse_request(self, route, env, matcher, coll, request_uri,
+                      use_abs_prefix=False):
+        matched_str = matcher.group(0)
+        rel_prefix = env.get('SCRIPT_NAME', '') + '/'
+
+        if matched_str:
+            rel_prefix += matched_str + '/'
+            # remove the '/' + rel_prefix part of uri
+            wb_url_str = request_uri[len(matched_str) + 2:]
+        else:
+            # the request_uri is the wb_url, since no coll
+            wb_url_str = request_uri[1:]
+
+        wbrequest = route.request_class(env,
+                              request_uri=request_uri,
+                              wb_url_str=wb_url_str,
+                              rel_prefix=rel_prefix,
+                              coll=coll,
+                              use_abs_prefix=use_abs_prefix,
+                              wburl_class=route.handler.get_wburl_type(),
+                              urlrewriter_class=self.urlrewriter_class,
+                              cookie_scope=route.cookie_scope,
+                              rewrite_opts=route.rewrite_opts,
+                              user_metadata=route.user_metadata)
+
+        # Allow for applying of additional filters
+        route.apply_filters(wbrequest, matcher)
+
+        return wbrequest
 
     def render_home_page(self, env):
-        # render the homepage!
         if self.home_view:
-            return self.home_view.render_response(env=env, routes=self.routes)
+            params = env.get('pywb.template_params', {})
+            return self.home_view.render_response(env=env, routes=self.routes, **params)
         else:
-            # default home page template
-            text = '\n'.join(map(str, self.routes))
-            return WbResponse.text_response(text)
+            return None
+
+    #=================================================================
+    # adapted from wsgiref.request_uri, but doesn't include domain name
+    # and allows all characters which are allowed in the path segment
+    # according to: http://tools.ietf.org/html/rfc3986#section-3.3
+    # explained here:
+    # http://stackoverflow.com/questions/4669692/
+    #   valid-characters-for-directory-part-of-a-url-for-short-links
+
+    @staticmethod
+    def ensure_rel_uri_set(env):
+        """ Return the full requested path, including the query string
+        """
+        if 'REL_REQUEST_URI' in env:
+            return env['REL_REQUEST_URI']
+
+        if not env.get('SCRIPT_NAME') and env.get('REQUEST_URI'):
+            env['REL_REQUEST_URI'] = env['REQUEST_URI']
+            return env['REL_REQUEST_URI']
+
+        url = quote(env.get('PATH_INFO', ''), safe='/~!$&\'()*+,;=:@')
+        query = env.get('QUERY_STRING')
+        if query:
+            url += '?' + query
+
+        env['REL_REQUEST_URI'] = url
+        return url
 
 
 #=================================================================
@@ -61,58 +118,36 @@ class Route(object):
     # match upto next / or ? or end
     SLASH_QUERY_LOOKAHEAD = '(?=/|$|\?)'
 
-    def __init__(self, regex, handler, coll_group=0, config={},
+    def __init__(self, regex, handler, config=None,
+                 request_class=WbRequest,
                  lookahead=SLASH_QUERY_LOOKAHEAD):
 
+        config = config or {}
         self.path = regex
         if regex:
             self.regex = re.compile(regex + lookahead)
         else:
             self.regex = re.compile('')
+
         self.handler = handler
+        self.request_class = request_class
+
         # collection id from regex group (default 0)
-        self.coll_group = coll_group
+        self.coll_group = int(config.get('coll_group', 0))
+        self.cookie_scope = config.get('cookie_scope')
+        self.rewrite_opts = config.get('rewrite_opts', {})
+        self.user_metadata = config.get('metadata', {})
         self._custom_init(config)
 
-    def __call__(self, env, use_abs_prefix):
-        wbrequest = self.parse_request(env, use_abs_prefix)
-        return self.handler(wbrequest) if wbrequest else None
-
-    def parse_request(self, env, use_abs_prefix, request_uri=None):
-        if not request_uri:
-            request_uri = env['REL_REQUEST_URI']
-
+    def is_handling(self, request_uri):
         matcher = self.regex.match(request_uri[1:])
         if not matcher:
-            return None
-
-        matched_str = matcher.group(0)
-        if matched_str:
-            rel_prefix = env['SCRIPT_NAME'] + '/' + matched_str + '/'
-            # remove the '/' + rel_prefix part of uri
-            wb_url_str = request_uri[len(matched_str) + 2:]
-        else:
-            rel_prefix = env['SCRIPT_NAME'] + '/'
-            # the request_uri is the wb_url, since no coll
-            wb_url_str = request_uri[1:]
+            return None, None
 
         coll = matcher.group(self.coll_group)
+        return matcher, coll
 
-        wbrequest = WbRequest(env,
-                              request_uri=request_uri,
-                              wb_url_str=wb_url_str,
-                              rel_prefix=rel_prefix,
-                              coll=coll,
-                              use_abs_prefix=use_abs_prefix,
-                              wburl_class=self.handler.get_wburl_type(),
-                              urlrewriter_class=UrlRewriter)
-
-        # Allow for applying of additional filters
-        self._apply_filters(wbrequest, matcher)
-
-        return wbrequest
-
-    def _apply_filters(self, wbrequest, matcher):
+    def apply_filters(self, wbrequest, matcher):
         for filter in self.filters:
             last_grp = len(matcher.groups())
             filter_str = filter.format(matcher.group(last_grp))
@@ -121,24 +156,16 @@ class Route(object):
     def _custom_init(self, config):
         self.filters = config.get('filters', [])
 
-    def __str__(self):
-        #return '* ' + self.regex_str + ' => ' + str(self.handler)
-        return str(self.handler)
-
 
 #=================================================================
 # ReferRedirect -- redirect urls that have 'fallen through'
 # based on the referrer settings
 #=================================================================
 class ReferRedirect:
-    def __init__(self, match_prefixs):
-        if isinstance(match_prefixs, list):
-            self.match_prefixs = match_prefixs
-        else:
-            self.match_prefixs = [match_prefixs]
-
-    def __call__(self, env, routes):
+    def __call__(self, env, the_router):
         referrer = env.get('HTTP_REFERER')
+
+        routes = the_router.routes
 
         # ensure there is a referrer
         if referrer is None:
@@ -147,14 +174,14 @@ class ReferRedirect:
         # get referrer path name
         ref_split = urlparse.urlsplit(referrer)
 
-        # ensure referrer starts with one of allowed hosts
-        if not any(referrer.startswith(i) for i in self.match_prefixs):
-            if ref_split.netloc != env.get('HTTP_HOST'):
-                return None
+        # require that referrer starts with current Host, if any
+        curr_host = env.get('HTTP_HOST')
+        if curr_host and curr_host != ref_split.netloc:
+            return None
 
         path = ref_split.path
 
-        app_path = env['SCRIPT_NAME']
+        app_path = env.get('SCRIPT_NAME', '')
 
         if app_path:
             # must start with current app name, if not root
@@ -163,17 +190,19 @@ class ReferRedirect:
 
             path = path[len(app_path):]
 
+        ref_route = None
+        ref_request = None
+
         for route in routes:
-            ref_request = route.parse_request(env, False, request_uri=path)
-            if ref_request:
+            matcher, coll = route.is_handling(path)
+            if matcher:
+                ref_request = the_router.parse_request(route, env,
+                                                       matcher, coll, path)
+                ref_route = route
                 break
 
-        # must have matched one of the routes
-        if not ref_request:
-            return None
-
-        # must have a rewriter
-        if not ref_request.urlrewriter:
+        # must have matched one of the routes with a urlrewriter
+        if not ref_request or not ref_request.urlrewriter:
             return None
 
         rewriter = ref_request.urlrewriter
@@ -188,10 +217,19 @@ class ReferRedirect:
             # 2013/path.html -> /path.html
             rel_request_uri = rel_request_uri[len(timestamp_path) - 1:]
 
+        rewritten_url = rewriter.rewrite(rel_request_uri)
+
+        # if post, can't redirect as that would lost the post data
+        # (can't use 307 because FF will show confirmation warning)
+        if ref_request.method == 'POST':
+            new_wb_url = WbUrl(rewritten_url[len(rewriter.prefix):])
+            ref_request.wb_url.url = new_wb_url.url
+            return ref_route.handler(ref_request)
+
         final_url = urlparse.urlunsplit((ref_split.scheme,
                                          ref_split.netloc,
-                                         rewriter.rewrite(rel_request_uri),
+                                         rewritten_url,
                                          '',
                                          ''))
 
-        return WbResponse.redir_response(final_url)
+        return WbResponse.redir_response(final_url, status='302 Temp Redirect')
