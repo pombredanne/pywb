@@ -8,7 +8,8 @@ import mimetypes
 import logging
 import os
 
-from urlparse import urlsplit
+from six.moves.urllib.parse import urlsplit
+import six
 
 from pywb.utils.loaders import is_http, LimitReader, LocalFileLoader, to_file_url
 from pywb.utils.loaders import extract_client_cookie
@@ -16,7 +17,7 @@ from pywb.utils.timeutils import timestamp_now
 from pywb.utils.statusandheaders import StatusAndHeaders
 from pywb.utils.canonicalize import canonicalize
 
-from rewrite_content import RewriteContent
+from pywb.rewrite.rewrite_content import RewriteContent
 
 
 #=================================================================
@@ -38,6 +39,9 @@ class LiveRewriter(object):
         else:
             logging.debug('Live Rewrite Direct (no proxy)')
 
+    def is_recording(self):
+        return self.proxies is not None
+
     def fetch_local_file(self, uri):
         #fh = open(uri)
         fh = LocalFileLoader().load(uri)
@@ -57,7 +61,7 @@ class LiveRewriter(object):
         splits = urlsplit(url)
         has_cookies = False
 
-        for name, value in env.iteritems():
+        for name, value in six.iteritems(env):
             if name == 'HTTP_HOST':
                 name = 'Host'
                 value = splits.netloc
@@ -73,6 +77,9 @@ class LiveRewriter(object):
                     value = cookie_val
 
             elif name == 'HTTP_REFERER':
+                continue
+
+            elif name == 'HTTP_X_PYWB_REQUESTED_WITH':
                 continue
 
             elif name == 'HTTP_X_FORWARDED_PROTO':
@@ -123,14 +130,14 @@ class LiveRewriter(object):
                    env=None,
                    req_headers=None,
                    follow_redirects=False,
-                   ignore_proxies=False,
+                   skip_recording=False,
                    verify=True):
 
         method = 'GET'
         data = None
 
         proxies = None
-        if not ignore_proxies:
+        if not skip_recording:
             proxies = self.proxies
 
         if not req_headers:
@@ -161,7 +168,21 @@ class LiveRewriter(object):
         statusline = str(response.status_code) + ' ' + response.reason
 
         headers = response.headers.items()
+
         stream = response.raw
+
+        try:  #pragma: no cover
+        #PY 3
+            headers = stream._original_response.headers._headers
+        except:  #pragma: no cover
+        #PY 2
+            headers = []
+            resp_headers = stream._original_response.msg.headers
+            for h in resp_headers:
+                n, v = h.split(':', 1)
+                n = n.strip()
+                v = v.strip()
+                headers.append((n, v))
 
         status_headers = StatusAndHeaders(statusline, headers)
 
@@ -174,7 +195,7 @@ class LiveRewriter(object):
                       req_headers={},
                       timestamp=None,
                       follow_redirects=False,
-                      ignore_proxies=False,
+                      skip_recording=False,
                       verify=True,
                       remote_only=True):
 
@@ -203,7 +224,7 @@ class LiveRewriter(object):
             (status_headers, stream) = self.fetch_http(url, urlkey, env,
                                                        req_headers,
                                                        follow_redirects,
-                                                       ignore_proxies,
+                                                       skip_recording,
                                                        verify)
         else:
             (status_headers, stream) = self.fetch_local_file(url)
@@ -232,11 +253,62 @@ class LiveRewriter(object):
 
         return result
 
+    def fetch_async(self, url, headers):
+        resp = self.live_request(method='GET',
+                                 url=url,
+                                 headers=headers,
+                                 proxies=self.proxies,
+                                 verify=False,
+                                 stream=True)
+
+        # don't actually read whole response,
+        # proxy response for writing it
+        resp.close()
+
+    def add_metadata(self, url, headers, data):
+        return self.live_request(method='PUTMETA',
+                                 url=url,
+                                 data=data,
+                                 headers=headers,
+                                 proxies=self.proxies,
+                                 verify=False)
+
     def get_rewritten(self, *args, **kwargs):
         result = self.fetch_request(*args, **kwargs)
 
         status_headers, gen, is_rewritten = result
 
-        buff = ''.join(gen)
+        buff = b''.join(gen)
 
         return (status_headers, buff)
+
+    def get_video_info(self, url):
+        return youtubedl.extract_info(url)
+
+
+#=================================================================
+class YoutubeDLWrapper(object):  #pragma: no cover
+    """ YoutubeDL wrapper, inits youtubee-dl if it is available
+    """
+    def __init__(self):
+        try:
+            from youtube_dl import YoutubeDL as YoutubeDL
+        except ImportError:
+            self.ydl = None
+            return
+
+        self.ydl = YoutubeDL(dict(simulate=True,
+                                  youtube_include_dash_manifest=False))
+        self.ydl.add_default_info_extractors()
+
+    def extract_info(self, url):
+        if not self.ydl:
+            return None
+
+        info = self.ydl.extract_info(url)
+        return info
+
+
+#=================================================================
+youtubedl = YoutubeDLWrapper()
+

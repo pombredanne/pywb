@@ -2,6 +2,8 @@ from pywb.rewrite.rewrite_live import LiveRewriter
 from pywb.rewrite.url_rewriter import UrlRewriter
 from pywb.rewrite.wburl import WbUrl
 
+from pywb.utils.loaders import to_native_str
+
 from pywb import get_test_dir
 
 from io import BytesIO
@@ -90,13 +92,13 @@ def test_local_no_head():
                                          'com,example,test)/')
 
     # wombat insert added
-    assert '<script src="/static/__pywb/wombat.js"> </script>' in buff
+    assert '<script src="/static/__pywb/wombat.js"> </script>' in buff, buff
 
     # location rewritten
-    assert 'window.WB_wombat_location = "/other.html"' in buff
+    assert 'window.WB_wombat_location = "/other.html"' in buff, buff
 
     # link rewritten
-    assert '"/pywb/20131226101010/http://example.com/some/path/another.html"' in buff
+    assert '"/pywb/20131226101010/http://example.com/some/path/another.html"' in buff, buff
 
 def test_local_no_head_only_title():
     status_headers, buff = get_rewritten(get_test_dir() + 'text_content/sample_no_head_2.html',
@@ -200,14 +202,14 @@ def test_local_unclosed_script():
 
 
 def test_example_1():
-    status_headers, buff = get_rewritten('http://example.com/', urlrewriter, req_headers={'Connection': 'close'})
+    status_headers, buff = get_rewritten('http://example.com/', urlrewriter, req_headers={'Connection': 'close', 'Accept-Encoding': 'identity'})
 
     # verify header rewriting
-    assert (('X-Archive-Orig-Content-Length', '1270') in status_headers.headers), status_headers
+    assert status_headers.get_header('x-archive-orig-content-length') == '1270', status_headers
 
 
     # verify utf-8 charset detection
-    assert status_headers.get_header('content-type') == 'text/html; charset=utf-8'
+    assert status_headers.get_header('content-type') == 'text/html'
 
     assert '/pywb/20131226101010/http://www.iana.org/domains/example' in buff, buff
 
@@ -243,7 +245,7 @@ def test_wombat_top():
     assert 'WB_wombat_top!==window' in buff
 
 def test_post():
-    buff = BytesIO('ABC=DEF')
+    buff = BytesIO(b'ABC=DEF')
 
     env = {'REQUEST_METHOD': 'POST',
            'HTTP_ORIGIN': 'http://httpbin.org',
@@ -253,6 +255,17 @@ def test_post():
     status_headers, resp_buff = get_rewritten('http://httpbin.org/post', urlrewriter, env=env)
     assert status_headers.get_statuscode() == '200', status_headers
 
+def test_multiple_set_cookies():
+    status_headers, buff = get_rewritten('http://httpbin.org/cookies/set?A=B&C=D', urlrewriter)
+
+    assert status_headers.get_statuscode() == '302'
+
+    print(status_headers.headers)
+
+    assert ('Set-Cookie', 'A=B; Path=/pywb/20131226101010/http://example.com/') in status_headers.headers
+    assert ('Set-Cookie', 'C=D; Path=/pywb/20131226101010/http://example.com/') in status_headers.headers
+
 
 def get_rewritten(*args, **kwargs):
-    return LiveRewriter().get_rewritten(remote_only=False, *args, **kwargs)
+    status_headers, buff = LiveRewriter().get_rewritten(remote_only=False, *args, **kwargs)
+    return status_headers, to_native_str(buff)

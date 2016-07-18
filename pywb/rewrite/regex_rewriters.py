@@ -1,8 +1,6 @@
 import re
-import sys
-import itertools
 
-from url_rewriter import UrlRewriter
+from pywb.rewrite.url_rewriter import UrlRewriter
 
 
 #=================================================================
@@ -101,7 +99,7 @@ class RegexRewriter(object):
                 result = (match, replace, group)
                 return result
 
-            return map(parse_rule, config)
+            return list(map(parse_rule, config))
         return run_parse_rules
 
 
@@ -138,6 +136,7 @@ class JSLocationRewriterMixin(object):
 
           (r'(?<=\.)postMessage\b\(', RegexRewriter.add_prefix('__WB_pmw(window).'), 0),
 
+          (r'(?<=\.)frameElement\b', RegexRewriter.add_prefix(prefix), 0),
           #  (r'(?<=document\.)domain', RegexRewriter.add_prefix(prefix), 0),
           #  (r'(?<=document\.)referrer', RegexRewriter.add_prefix(prefix), 0),
           #  (r'(?<=document\.)cookie', RegexRewriter.add_prefix(prefix), 0),

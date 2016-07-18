@@ -1,12 +1,17 @@
-from wbrequestresponse import WbResponse
+from pywb.framework.wbrequestresponse import WbResponse
 from pywb.utils.loaders import extract_client_cookie
+from pywb.utils.wbexception import WbException
 from pywb.utils.statusandheaders import StatusAndHeaders
 from pywb.rewrite.wburl import WbUrl
 
-from cache import create_cache
-from basehandlers import WbUrlHandler
+from pywb.framework.cache import create_cache
+from pywb.framework.basehandlers import WbUrlHandler
 
-import urlparse
+from six.moves.urllib.parse import parse_qs, urlsplit
+import six
+
+from pywb.utils.loaders import to_native_str
+
 import base64
 import os
 import json
@@ -16,7 +21,7 @@ import json
 class BaseCollResolver(object):
     def __init__(self, routes, config):
         self.routes = routes
-        self.use_default_coll = config.get('use_default_coll', True)
+        self.use_default_coll = config.get('use_default_coll')
 
     @property
     def pre_connect(self):
@@ -32,16 +37,16 @@ class BaseCollResolver(object):
 
         # invalid parsing
         if proxy_coll == '':
-            return None, None, None, None, self.select_coll_response(env)
+            return None, None, None, None, self.select_coll_response(env, proxy_coll)
 
         if proxy_coll is None and isinstance(self.use_default_coll, str):
             proxy_coll = self.use_default_coll
 
         if proxy_coll:
-            proxy_coll = '/' + proxy_coll + '/'
+            path = '/' + proxy_coll + '/'
 
             for r in self.routes:
-                matcher, c = r.is_handling(proxy_coll)
+                matcher, c = r.is_handling(path)
                 if matcher:
                     route = r
                     coll = c
@@ -49,17 +54,18 @@ class BaseCollResolver(object):
 
             # if no match, return coll selection response
             if not route:
-                return None, None, None, None, self.select_coll_response(env)
+                return None, None, None, None, self.select_coll_response(env, proxy_coll)
 
         # if 'use_default_coll', find first WbUrl-handling collection
         elif self.use_default_coll:
-            for route in self.routes:
-                if isinstance(route.handler, WbUrlHandler):
-                    return route, route.path, matcher, ts, None
+            raise Exception('use_default_coll: true no longer supported, please specify collection name')
+            #for route in self.routes:
+            #    if isinstance(route.handler, WbUrlHandler):
+            #        return route, route.path, matcher, ts, None
 
         # otherwise, return the appropriate coll selection response
         else:
-            return None, None, None, None, self.select_coll_response(env)
+            return None, None, None, None, self.select_coll_response(env, proxy_coll)
 
         return route, coll, matcher, ts, None
 
@@ -76,6 +82,10 @@ class ProxyAuthResolver(BaseCollResolver):
     def pre_connect(self):
         return True
 
+    @property
+    def supports_switching(self):
+        return False
+
     def get_proxy_coll_ts(self, env):
         proxy_auth = env.get('HTTP_PROXY_AUTHORIZATION')
 
@@ -85,7 +95,7 @@ class ProxyAuthResolver(BaseCollResolver):
         proxy_coll = self.read_basic_auth_coll(proxy_auth)
         return proxy_coll, None
 
-    def select_coll_response(self, env):
+    def select_coll_response(self, env, default_coll=None):
         proxy_msg = 'Basic realm="{0}"'.format(self.auth_msg)
 
         headers = [('Content-Type', 'text/plain'),
@@ -95,7 +105,7 @@ class ProxyAuthResolver(BaseCollResolver):
 
         value = self.auth_msg
 
-        return WbResponse(status_headers, value=[value])
+        return WbResponse(status_headers, value=[value.encode('utf-8')])
 
     @staticmethod
     def read_basic_auth_coll(value):
@@ -106,42 +116,54 @@ class ProxyAuthResolver(BaseCollResolver):
         if len(parts) != 2:
             return ''
 
-        user_pass = base64.b64decode(parts[1])
-        return user_pass.split(':')[0]
+        user_pass = base64.b64decode(parts[1].encode('utf-8'))
+        return to_native_str(user_pass.split(b':')[0])
 
 
 #=================================================================
 class IPCacheResolver(BaseCollResolver):
     def __init__(self, routes, config):
         super(IPCacheResolver, self).__init__(routes, config)
-        self.cache = create_cache()
+        self.cache = create_cache(config.get('redis_cache_key'))
         self.magic_name = config['magic_name']
+
+    @property
+    def supports_switching(self):
+        return False
 
     def _get_ip(self, env):
         ip = env['REMOTE_ADDR']
         qs = env.get('pywb.proxy_query')
         if qs:
-            res = urlparse.parse_qs(qs)
+            res = parse_qs(qs)
 
             if 'ip' in res:
                 ip = res['ip'][0]
 
         return ip
 
+    def select_coll_response(self, env, default_coll=None):
+        raise WbException('Invalid Proxy Collection Specified: ' + str(default_coll))
+
     def get_proxy_coll_ts(self, env):
         ip = env['REMOTE_ADDR']
         qs = env.get('pywb.proxy_query')
+
         if qs:
-            res = urlparse.parse_qs(qs)
+            res = parse_qs(qs)
 
             if 'ip' in res:
                 ip = res['ip'][0]
 
-            if 'coll' in res:
-                self.cache[ip + ':c'] = res['coll'][0]
+            if 'delete' in res:
+                del self.cache[ip + ':c']
+                del self.cache[ip + ':t']
+            else:
+                if 'coll' in res:
+                    self.cache[ip + ':c'] = res['coll'][0]
 
-            if 'ts' in res:
-                self.cache[ip + ':t'] = res['ts'][0]
+                if 'ts' in res:
+                    self.cache[ip + ':t'] = res['ts'][0]
 
         coll = self.cache[ip + ':c']
         ts = self.cache[ip + ':t']
@@ -181,11 +203,15 @@ class CookieResolver(BaseCollResolver):
 
         self.cache = create_cache()
 
+    @property
+    def supports_switching(self):
+        return True
+
     def get_proxy_coll_ts(self, env):
         coll, ts, sesh_id = self.get_coll(env)
         return coll, ts
 
-    def select_coll_response(self, env):
+    def select_coll_response(self, env, default_coll=None):
         return self.make_magic_response('auto',
                                         env['REL_REQUEST_URI'],
                                         env)
@@ -202,7 +228,7 @@ class CookieResolver(BaseCollResolver):
 
     def handle_magic_page(self, env):
         request_url = env['REL_REQUEST_URI']
-        parts = urlparse.urlsplit(request_url)
+        parts = urlsplit(request_url)
         server_name = env['pywb.proxy_host']
 
         path_url = parts.path[1:]
@@ -288,7 +314,7 @@ class CookieResolver(BaseCollResolver):
         if '://' not in path_url:
             path_url = 'http://' + path_url
 
-        path_parts = urlparse.urlsplit(path_url)
+        path_parts = urlsplit(path_url)
 
         new_url = path_parts.path[1:]
         if path_parts.query:
@@ -335,14 +361,14 @@ class CookieResolver(BaseCollResolver):
             return sesh_id
 
         sesh_id = base64.b32encode(os.urandom(5)).lower()
-        return sesh_id
+        return to_native_str(sesh_id)
 
     def make_redir_response(self, url, headers=None):
         if not headers:
             headers = []
 
         if self.extra_headers:
-            for name, value in self.extra_headers.iteritems():
+            for name, value in six.iteritems(self.extra_headers):
                 headers.append((name, value))
 
         return WbResponse.redir_response(url, headers=headers)

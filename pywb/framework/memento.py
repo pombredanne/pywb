@@ -2,9 +2,10 @@ from pywb.utils.wbexception import BadRequestException
 from pywb.utils.timeutils import http_date_to_timestamp
 from pywb.utils.timeutils import timestamp_to_http_date
 
-from wbrequestresponse import WbRequest, WbResponse
+from pywb.framework.wbrequestresponse import WbRequest, WbResponse
 from pywb.rewrite.wburl import WbUrl
 
+import six
 LINK_FORMAT = 'application/link-format'
 
 
@@ -181,14 +182,19 @@ def make_timemap(wbrequest, cdx_lines):
     mod = wbrequest.options.get('replay_mod', '')
 
     # get first memento as it'll be used for 'from' field
-    first_cdx = cdx_lines.next()
-    from_date = timestamp_to_http_date(first_cdx['timestamp'])
+    try:
+        first_cdx = six.next(cdx_lines)
+        from_date = timestamp_to_http_date(first_cdx['timestamp'])
+    except StopIteration:
+        first_cdx = None
 
-    # timemap link
-    timemap = ('<{0}>; rel="self"; ' +
-               'type="application/link-format"; from="{1}",\n')
-    yield timemap.format(prefix + wbrequest.wb_url.to_str(),
-                         from_date)
+
+    if first_cdx:
+        # timemap link
+        timemap = ('<{0}>; rel="self"; ' +
+                   'type="application/link-format"; from="{1}",\n')
+        yield timemap.format(prefix + wbrequest.wb_url.to_str(),
+                             from_date)
 
     # original link
     original = '<{0}>; rel="original",\n'
@@ -201,6 +207,12 @@ def make_timemap(wbrequest, cdx_lines):
                                      type=WbUrl.LATEST_REPLAY)
 
     yield timegate.format(prefix + timegate_url)
+
+    if not first_cdx:
+        # terminating timemap link, no from
+        timemap = ('<{0}>; rel="self"; type="application/link-format"')
+        yield timemap.format(prefix + wbrequest.wb_url.to_str())
+        return
 
     # first memento link
     yield make_timemap_memento_link(first_cdx, prefix,

@@ -2,9 +2,14 @@
 Representation and parsing of HTTP-style status + headers
 """
 
-import pprint
+from pprint import pformat
 from copy import copy
+from six.moves import range
+from six import iteritems
+from pywb.utils.loaders import to_native_str
 
+
+WRAP_WIDTH = 80
 
 #=================================================================
 class StatusAndHeaders(object):
@@ -36,7 +41,7 @@ class StatusAndHeaders(object):
         return old header value, if any
         """
         name_lower = name.lower()
-        for index in xrange(len(self.headers) - 1, -1, -1):
+        for index in range(len(self.headers) - 1, -1, -1):
             curr_name, curr_value = self.headers[index]
             if curr_name.lower() == name_lower:
                 self.headers[index] = (curr_name, value)
@@ -52,14 +57,14 @@ class StatusAndHeaders(object):
         """
         header_dict = copy(header_dict)
 
-        for index in xrange(len(self.headers) - 1, -1, -1):
+        for index in range(len(self.headers) - 1, -1, -1):
             curr_name, curr_value = self.headers[index]
             name_lower = curr_name.lower()
             if name_lower in header_dict:
                 self.headers[index] = (curr_name, header_dict[name_lower])
                 del header_dict[name_lower]
 
-        for name, value in header_dict.iteritems():
+        for name, value in iteritems(header_dict):
             self.headers.append((name, value))
 
     def remove_header(self, name):
@@ -68,7 +73,7 @@ class StatusAndHeaders(object):
         return True if header removed, False otherwise
         """
         name_lower = name.lower()
-        for index in xrange(len(self.headers) - 1, -1, -1):
+        for index in range(len(self.headers) - 1, -1, -1):
             if self.headers[index][0].lower() == name_lower:
                 del self.headers[index]
                 return True
@@ -93,7 +98,7 @@ class StatusAndHeaders(object):
             code = int(code)
             assert(code > 0)
             return True
-        except ValueError, AssertionError:
+        except(ValueError, AssertionError):
             self.statusline = valid_statusline
             return False
 
@@ -111,7 +116,7 @@ class StatusAndHeaders(object):
         return self
 
     def __repr__(self):
-        headers_str = pprint.pformat(self.headers, indent=2)
+        headers_str = pformat(self.headers, indent=2, width=WRAP_WIDTH)
         return "StatusAndHeaders(protocol = '{0}', statusline = '{1}', \
 headers = {2})".format(self.protocol, self.statusline, headers_str)
 
@@ -119,6 +124,32 @@ headers = {2})".format(self.protocol, self.statusline, headers_str)
         return (self.statusline == other.statusline and
                 self.headers == other.headers and
                 self.protocol == other.protocol)
+
+    def __str__(self, exclude_list=None):
+        return self.to_str(exclude_list)
+
+    def to_str(self, exclude_list):
+        string = self.protocol
+
+        if string and self.statusline:
+            string += ' '
+
+        if self.statusline:
+            string += self.statusline
+
+        if string:
+            string += '\r\n'
+
+        for h in self.headers:
+            if exclude_list and h[0].lower() in exclude_list:
+                continue
+
+            string += ': '.join(h) + '\r\n'
+
+        return string
+
+    def to_bytes(self, exclude_list=None):
+        return self.to_str(exclude_list).encode('iso-8859-1') + b'\r\n'
 
 
 #=================================================================
@@ -144,9 +175,15 @@ class StatusAndHeadersParser(object):
 
         support continuation headers starting with space or tab
         """
+
+        def readline():
+            return to_native_str(stream.readline())
+
         # status line w newlines intact
         if full_statusline is None:
-            full_statusline = stream.readline()
+            full_statusline = readline()
+        else:
+            full_statusline = to_native_str(full_statusline)
 
         statusline, total_read = _strip_count(full_statusline, 0)
 
@@ -172,7 +209,7 @@ class StatusAndHeadersParser(object):
         else:
             protocol_status = statusline.split(' ', 1)
 
-        line, total_read = _strip_count(stream.readline(), total_read)
+        line, total_read = _strip_count(readline(), total_read)
         while line:
             result = line.split(':', 1)
             if len(result) == 2:
@@ -182,14 +219,14 @@ class StatusAndHeadersParser(object):
                 name = result[0]
                 value = None
 
-            next_line, total_read = _strip_count(stream.readline(),
+            next_line, total_read = _strip_count(readline(),
                                                  total_read)
 
             # append continuation lines, if any
             while next_line and next_line.startswith((' ', '\t')):
                 if value is not None:
                     value += next_line
-                next_line, total_read = _strip_count(stream.readline(),
+                next_line, total_read = _strip_count(readline(),
                                                      total_read)
 
             if value is not None:
@@ -198,7 +235,12 @@ class StatusAndHeadersParser(object):
 
             line = next_line
 
-        return StatusAndHeaders(statusline=protocol_status[1].strip(),
+        if len(protocol_status) > 1:
+            statusline = protocol_status[1].strip()
+        else:
+            statusline = ''
+
+        return StatusAndHeaders(statusline=statusline,
                                 headers=headers,
                                 protocol=protocol_status[0],
                                 total_len=total_read)

@@ -14,9 +14,10 @@ from pywb.framework.wbrequestresponse import WbResponse
 
 from pywb.warc.recordloader import ArcWarcRecordLoader
 from pywb.warc.resolvingloader import ResolvingLoader
+from pywb.warc.pathresolvers import PathResolverMapper
 
-from views import J2TemplateView, init_view
-from replay_views import ReplayView
+from pywb.webapp.views import J2TemplateView, init_view
+from pywb.webapp.replay_views import ReplayView
 from pywb.framework.memento import MementoResponse
 from pywb.utils.timeutils import datetime_to_timestamp
 
@@ -107,7 +108,7 @@ class SearchPageWbUrlHandler(WbUrlHandler):
     def get_top_frame_response(self, wbrequest):
         params = self.get_top_frame_params(wbrequest, mod=self.replay_mod)
 
-        headers = [('Content-Type', 'text/html; charset=utf-8')]
+        headers = [('Content-Type', 'text/html')]
         status_headers = StatusAndHeaders('200 OK', headers)
 
         template_result = self.frame_insert_view.render_to_string(**params)
@@ -137,7 +138,7 @@ class WBHandler(SearchPageWbUrlHandler):
 
         paths = config.get('archive_paths')
 
-        resolving_loader = ResolvingLoader(paths=paths,
+        resolving_loader = ResolvingLoader(PathResolverMapper()(paths),
                                            record_loader=record_loader)
 
         return ReplayView(resolving_loader, config)
@@ -176,7 +177,8 @@ class WBHandler(SearchPageWbUrlHandler):
 
         # if capture query, just return capture page
         if wbrequest.wb_url.is_query():
-            return self.index_reader.make_cdx_response(wbrequest, [], 'html')
+            output = self.index_reader.get_output_type(wbrequest.wb_url)
+            return self.index_reader.make_cdx_response(wbrequest, iter([]), output)
         else:
             return self.not_found_view.render_response(status='404 Not Found',
                                                        wbrequest=wbrequest,
@@ -208,7 +210,7 @@ class StaticHandler(BaseHandler):
             if 'wsgi.file_wrapper' in wbrequest.env:
                 reader = wbrequest.env['wsgi.file_wrapper'](data)
             else:
-                reader = iter(lambda: data.read(), '')
+                reader = iter(lambda: data.read(), b'')
 
             content_type = 'application/octet-stream'
 
@@ -216,9 +218,9 @@ class StaticHandler(BaseHandler):
             if guessed[0]:
                 content_type = guessed[0]
 
-            return WbResponse.text_stream(reader,
-                                          content_type=content_type,
-                                          headers=headers)
+            return WbResponse.bin_stream(reader,
+                                         content_type=content_type,
+                                         headers=headers)
 
         except IOError:
             raise NotFoundException('Static File Not Found: ' +

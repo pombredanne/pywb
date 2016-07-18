@@ -63,8 +63,12 @@ this.create_banner_element = function() {
 
 this.ts_to_date = function(ts, is_gmt)
 {
+    if (!ts) {
+        return "";
+    }
+
     if (ts.length < 14) {
-        return ts;
+        ts += "00000000000000".substr(ts.length);
     }
 
     var datestr = (ts.substring(0, 4) + "-" +
@@ -119,12 +123,23 @@ function notify_top() {
         return;
     }
 
-    if (window.__WB_top_frame.update_wb_url) {
-        window.__WB_top_frame.update_wb_url(window.WB_wombat_location.href,
-                                            wbinfo.timestamp,
-                                            wbinfo.request_ts,
-                                            wbinfo.is_live);
-    }
+    //if (window.__WB_top_frame.update_wb_url) {
+    //    window.__WB_top_frame.update_wb_url(window.WB_wombat_location.href,
+    //                                        wbinfo.timestamp,
+    //                                        wbinfo.request_ts,
+    //                                        wbinfo.is_live);
+    //}
+
+    var message = {
+               "url": window.WB_wombat_location.href,
+               "ts": wbinfo.timestamp,
+               "request_ts": wbinfo.request_ts,
+               "is_live": wbinfo.is_live,
+               "title": "",
+               "wb_type": "load",
+              }
+
+    window.__WB_top_frame.postMessage(message, "*");
 
     remove_event("readystatechange", notify_top, document);
 }

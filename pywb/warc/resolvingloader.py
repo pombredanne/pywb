@@ -1,18 +1,47 @@
 from pywb.utils.timeutils import iso_date_to_timestamp
-from recordloader import ArcWarcRecordLoader, ArchiveLoadFailed
-from pathresolvers import make_best_resolvers
+from pywb.warc.recordloader import ArcWarcRecordLoader, ArchiveLoadFailed
 from pywb.utils.wbexception import NotFoundException
+
+import six
 
 
 #=================================================================
 class ResolvingLoader(object):
     MISSING_REVISIT_MSG = 'Original for revisit record could not be loaded'
 
-    def __init__(self, paths, record_loader=ArcWarcRecordLoader()):
-        self.path_resolvers = make_best_resolvers(paths)
+    def __init__(self, path_resolvers, record_loader=ArcWarcRecordLoader(), no_record_parse=False):
+        self.path_resolvers = path_resolvers
         self.record_loader = record_loader
+        self.no_record_parse = no_record_parse
 
-    def __call__(self, cdx, failed_files, cdx_loader, *args):
+    def __call__(self, cdx, failed_files, cdx_loader, *args, **kwargs):
+        headers_record, payload_record = self.load_headers_and_payload(cdx, failed_files, cdx_loader)
+
+        # Default handling logic when loading http status/headers
+
+        # special case: set header to payload if old-style revisit
+        # with missing header
+        if not headers_record:
+            headers_record = payload_record
+        elif headers_record != payload_record:
+            # close remainder of stream as this record only used for
+            # (already parsed) headers
+            headers_record.stream.close()
+
+            # special case: check if headers record is actually empty
+            # (eg empty revisit), then use headers from revisit
+            if not headers_record.status_headers.headers:
+                headers_record = payload_record
+
+        if not headers_record or not payload_record:
+            raise ArchiveLoadFailed('Could not load ' + str(cdx))
+
+        # ensure status line is valid from here
+        headers_record.status_headers.validate_statusline('204 No Content')
+
+        return (headers_record.status_headers, payload_record.stream)
+
+    def load_headers_and_payload(self, cdx, failed_files, cdx_loader):
         """
         Resolve headers and payload for a given capture
         In the simple case, headers and payload are in the same record.
@@ -51,27 +80,8 @@ class ResolvingLoader(object):
         elif (has_orig):
             payload_record = self._resolve_path_load(cdx, True, failed_files)
 
-        # special case: set header to payload if old-style revisit
-        # with missing header
-        if not headers_record:
-            headers_record = payload_record
-        elif headers_record != payload_record:
-            # close remainder of stream as this record only used for
-            # (already parsed) headers
-            headers_record.stream.close()
+        return headers_record, payload_record
 
-            # special case: check if headers record is actually empty
-            # (eg empty revisit), then use headers from revisit
-            if not headers_record.status_headers.headers:
-                headers_record = payload_record
-
-        if not headers_record or not payload_record:
-            raise ArchiveLoadFailed('Could not load ' + str(cdx))
-
-        # ensure status line is valid from here
-        headers_record.status_headers.validate_statusline('204 No Content')
-
-        return (headers_record.status_headers, payload_record.stream)
 
     def _resolve_path_load(self, cdx, is_original, failed_files):
         """
@@ -102,18 +112,25 @@ class ResolvingLoader(object):
         last_exc = None
         last_traceback = None
         for resolver in self.path_resolvers:
-            possible_paths = resolver(filename)
+            possible_paths = resolver(filename, cdx)
 
-            if possible_paths:
-                for path in possible_paths:
-                    any_found = True
-                    try:
-                        return self.record_loader.load(path, offset, length)
+            if not possible_paths:
+                continue
 
-                    except Exception as ue:
-                        last_exc = ue
-                        import sys
-                        last_traceback = sys.exc_info()[2]
+            if isinstance(possible_paths, six.string_types):
+                possible_paths = [possible_paths]
+
+            for path in possible_paths:
+                any_found = True
+                try:
+                    return (self.record_loader.
+                             load(path, offset, length,
+                               no_record_parse=self.no_record_parse))
+
+                except Exception as ue:
+                    last_exc = ue
+                    import sys
+                    last_traceback = sys.exc_info()[2]
 
         # Unsuccessful if reached here
         if failed_files is not None:
@@ -125,7 +142,8 @@ class ResolvingLoader(object):
         else:
             msg = 'Archive File Not Found'
 
-        raise ArchiveLoadFailed(msg, filename), None, last_traceback
+        #raise ArchiveLoadFailed(msg, filename), None, last_traceback
+        six.reraise(ArchiveLoadFailed, ArchiveLoadFailed(msg, filename), last_traceback)
 
     def _load_different_url_payload(self, cdx, headers_record,
                                     failed_files, cdx_loader):

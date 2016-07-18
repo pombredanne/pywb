@@ -8,7 +8,7 @@ class TestOkApp:
     def __call__(self, env):
         def response(env, start_response):
             start_response('200 OK', [])
-            return ['Test']
+            return [b'Test']
         return response
 
 class TestErrApp:
@@ -32,7 +32,7 @@ def test_ok_app():
     resp = testapp.get('/')
 
     assert resp.status_int == 200
-    assert 'Test' in resp.body
+    assert b'Test' in resp.body, resp.body
 
 def test_err_app():
     the_app = init_app(initer(TestErrApp), load_yaml=False)
@@ -41,7 +41,7 @@ def test_err_app():
     resp = testapp.get('/abc', expect_errors=True)
 
     assert resp.status_int == 500
-    assert '500 Internal Server Error Error: Test Unexpected Error' in resp.body
+    assert b'500 Internal Server Error Error: Test Unexpected Error' in resp.body
 
 def test_custom_err_app():
     the_app = init_app(initer(TestCustomErrApp), load_yaml=False)
@@ -50,7 +50,7 @@ def test_custom_err_app():
     resp = testapp.get('/abc', expect_errors=True)
 
     assert resp.status_int == 403
-    assert '403 Access Denied Error: Forbidden Test' in resp.body
+    assert b'403 Access Denied Error: Forbidden Test' in resp.body
 
 
 

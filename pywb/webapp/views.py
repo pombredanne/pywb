@@ -2,13 +2,12 @@ from pywb.utils.timeutils import timestamp_to_datetime, timestamp_to_sec
 from pywb.framework.wbrequestresponse import WbResponse
 from pywb.framework.memento import make_timemap, LINK_FORMAT
 
-import urlparse
-import urllib
+from six.moves.urllib.parse import urlsplit
+
 import logging
 import json
 import os
 
-from itertools import imap
 from jinja2 import Environment
 from jinja2 import FileSystemLoader, PackageLoader, ChoiceLoader
 
@@ -48,7 +47,7 @@ def format_ts(value, format_='%a, %b %d %Y %H:%M:%S'):
 
 @template_filter('urlsplit')
 def get_urlsplit(url):
-    split = urlparse.urlsplit(url)
+    split = urlsplit(url)
     return split
 
 
@@ -137,7 +136,7 @@ class J2TemplateView(object):
         template_result = self.render_to_string(**kwargs)
         status = kwargs.get('status', '200 OK')
         content_type = kwargs.get('content_type', 'text/html; charset=utf-8')
-        return WbResponse.text_response(template_result.encode('utf-8'),
+        return WbResponse.text_response(template_result,
                                         status=status,
                                         content_type=content_type)
 
@@ -218,5 +217,6 @@ class J2HtmlCapturesView(J2TemplateView):
 class MementoTimemapView(object):
     def render_response(self, wbrequest, cdx_lines, **kwargs):
         memento_lines = make_timemap(wbrequest, cdx_lines)
+
         return WbResponse.text_stream(memento_lines,
                                       content_type=LINK_FORMAT)

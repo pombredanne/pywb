@@ -1,5 +1,3 @@
-import itertools
-import urlparse
 import collections
 
 from pywb.utils.statusandheaders import StatusAndHeaders
@@ -7,9 +5,13 @@ from pywb.utils.statusandheaders import StatusAndHeadersParser
 from pywb.utils.statusandheaders import StatusAndHeadersParserException
 
 from pywb.utils.loaders import BlockLoader, LimitReader
+from pywb.utils.loaders import to_native_str
 from pywb.utils.bufferedreaders import DecompressingBufferedReader
 
 from pywb.utils.wbexception import WbException
+
+from six.moves import zip
+import six
 
 
 #=================================================================
@@ -23,7 +25,7 @@ ArcWarcRecord = collections.namedtuple('ArcWarcRecord',
 class ArchiveLoadFailed(WbException):
     def __init__(self, reason, filename=''):
         if filename:
-            msg = filename + ':' + str(reason)
+            msg = filename + ': ' + str(reason)
         else:
             msg = str(reason)
 
@@ -34,7 +36,7 @@ class ArchiveLoadFailed(WbException):
 
 
 #=================================================================
-class ArcWarcRecordLoader:
+class ArcWarcRecordLoader(object):
     # Standard ARC v1.0 headers
     # TODO: support ARC v2.0 also?
     ARC_HEADERS = ["uri", "ip-address", "archive-date",
@@ -49,10 +51,13 @@ class ArcWarcRecordLoader:
 
     NON_HTTP_RECORDS = ('warcinfo', 'arc_header', 'metadata', 'resource')
 
+    NON_HTTP_SCHEMES = ('dns:', 'whois:', 'ntp:')
+    HTTP_SCHEMES = ('http:', 'https:')
+
     def __init__(self, loader=None, cookie_maker=None, block_size=8192,
                  verify_http=True):
         if not loader:
-            loader = BlockLoader(cookie_maker)
+            loader = BlockLoader(cookie_maker=cookie_maker)
 
         self.loader = loader
         self.block_size = block_size
@@ -64,7 +69,7 @@ class ArcWarcRecordLoader:
 
         self.http_req_parser = StatusAndHeadersParser(self.HTTP_VERBS, verify_http)
 
-    def load(self, url, offset, length):
+    def load(self, url, offset, length, no_record_parse=False):
         """ Load a single record from given url at offset with length
         and parse as either warc or arc record
         """
@@ -73,7 +78,7 @@ class ArcWarcRecordLoader:
         except:
             length = -1
 
-        stream = self.loader.load(url, long(offset), length)
+        stream = self.loader.load(url, int(offset), length)
         decomp_type = 'gzip'
 
         # Create decompressing stream
@@ -81,7 +86,7 @@ class ArcWarcRecordLoader:
                                              decomp_type=decomp_type,
                                              block_size=self.block_size)
 
-        return self.parse_record_stream(stream)
+        return self.parse_record_stream(stream, no_record_parse=no_record_parse)
 
     def parse_record_stream(self, stream,
                             statusline=None,
@@ -119,17 +124,21 @@ class ArcWarcRecordLoader:
         is_err = False
 
         try:
-            length = int(length) - sub_len
-            if length < 0:
-                is_err = True
-        except ValueError:
+            if length is not None:
+                length = int(length) - sub_len
+                if length < 0:
+                    is_err = True
+
+        except (ValueError, TypeError):
             is_err = True
 
         # err condition
         if is_err:
             length = 0
+
         # limit stream to the length for all valid records
-        stream = LimitReader.wrap_stream(stream, length)
+        if length is not None and length >= 0:
+            stream = LimitReader.wrap_stream(stream, length)
 
         # don't parse the http record at all
         if no_record_parse:
@@ -145,19 +154,21 @@ class ArcWarcRecordLoader:
             status_headers = StatusAndHeaders(msg, [])
 
         # response record or non-empty revisit: parse HTTP status and headers!
-        elif (rec_type in ('response', 'revisit') and
-              not uri.startswith(('dns:', 'whois:'))):
+        elif (rec_type in ('response', 'revisit')
+              and uri.startswith(self.HTTP_SCHEMES)):
             status_headers = self.http_parser.parse(stream)
 
         # request record: parse request
-        elif ((rec_type == 'request') and
-              not uri.startswith(('dns:', 'whois:'))):
+        elif ((rec_type == 'request')
+              and uri.startswith(self.HTTP_SCHEMES)):
             status_headers = self.http_req_parser.parse(stream)
 
         # everything else: create a no-status entry, set content-type
         else:
-            content_type_header = [('Content-Type', content_type),
-                                   ('Content-Length', str(length))]
+            content_type_header = [('Content-Type', content_type)]
+
+            if length is not None and length >= 0:
+                content_type_header.append(('Content-Length', str(length)))
 
             status_headers = StatusAndHeaders('200 OK', content_type_header)
 
@@ -200,16 +211,21 @@ class ArcWarcRecordLoader:
 
 
 #=================================================================
-class ARCHeadersParser:
+class ARCHeadersParser(object):
     def __init__(self, headernames):
         self.headernames = headernames
 
     def parse(self, stream, headerline=None):
         total_read = 0
 
+        def readline():
+            return to_native_str(stream.readline())
+
         # if headerline passed in, use that
         if headerline is None:
-            headerline = stream.readline()
+            headerline = readline()
+        else:
+            headerline = to_native_str(headerline)
 
         header_len = len(headerline)
 
@@ -222,8 +238,8 @@ class ARCHeadersParser:
 
         # if arc header, consume next two lines
         if headerline.startswith('filedesc://'):
-            version = stream.readline()  # skip version
-            spec = stream.readline()  # skip header spec, use preset one
+            version = readline()  # skip version
+            spec = readline()  # skip header spec, use preset one
             total_read += len(version)
             total_read += len(spec)
 
@@ -236,7 +252,7 @@ class ARCHeadersParser:
 
         headers = []
 
-        for name, value in itertools.izip(headernames, parts):
+        for name, value in zip(headernames, parts):
             headers.append((name, value))
 
         return StatusAndHeaders(statusline='',

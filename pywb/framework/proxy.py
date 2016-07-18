@@ -3,18 +3,24 @@ from __future__ import absolute_import
 from pywb.framework.wbrequestresponse import WbResponse, WbRequest
 from pywb.framework.archivalrouter import ArchivalRouter
 
-import urlparse
+from six.moves.urllib.parse import urlsplit
 import base64
 
 import socket
 import ssl
 
-from pywb.rewrite.url_rewriter import HttpsUrlRewriter
+from io import BytesIO
+
+from pywb.rewrite.url_rewriter import SchemeOnlyUrlRewriter, UrlRewriter
+from pywb.rewrite.rewrite_content import RewriteContent
 from pywb.utils.wbexception import BadRequestException
 
 from pywb.utils.bufferedreaders import BufferedReader
+from pywb.utils.loaders import to_native_str
 
 from pywb.framework.proxy_resolvers import ProxyAuthResolver, CookieResolver, IPCacheResolver
+
+from tempfile import SpooledTemporaryFile
 
 
 #=================================================================
@@ -55,6 +61,7 @@ class ProxyRouter(object):
 
     BLOCK_SIZE = 4096
     DEF_MAGIC_NAME = 'pywb.proxy'
+    BUFF_RESPONSE_MEM_SIZE = 1024*1024
 
     CERT_DL_PEM = '/pywb-ca.pem'
     CERT_DL_P12 = '/pywb-ca.p12'
@@ -84,13 +91,15 @@ class ProxyRouter(object):
             self.extra_headers = self.EXTRA_HEADERS
             proxy_options['extra_headers'] = self.extra_headers
 
-        res_type = proxy_options.get('cookie_resolver')
-        if res_type == True or res_type == 'cookie':
-            self.resolver = CookieResolver(routes, proxy_options)
+        res_type = proxy_options.get('cookie_resolver', True)
+        if res_type == 'auth' or not res_type:
+            self.resolver = ProxyAuthResolver(routes, proxy_options)
         elif res_type == 'ip':
             self.resolver = IPCacheResolver(routes, proxy_options)
+        #elif res_type == True or res_type == 'cookie':
+        #    self.resolver = CookieResolver(routes, proxy_options)
         else:
-            self.resolver = ProxyAuthResolver(routes, proxy_options)
+            self.resolver = CookieResolver(routes, proxy_options)
 
         self.use_banner = proxy_options.get('use_banner', True)
         self.use_wombat = proxy_options.get('use_client_rewrite', True)
@@ -158,7 +167,7 @@ class ProxyRouter(object):
 
             url = env['REL_REQUEST_URI']
         else:
-            parts = urlparse.urlsplit(env['REL_REQUEST_URI'])
+            parts = urlsplit(env['REL_REQUEST_URI'])
             hostport = parts.netloc.split(':', 1)
             env['pywb.proxy_host'] = hostport[0]
             env['pywb.proxy_port'] = hostport[1] if len(hostport) == 2 else ''
@@ -167,7 +176,8 @@ class ProxyRouter(object):
                 env['pywb.proxy_req_uri'] += '?' + parts.query
                 env['pywb.proxy_query'] = parts.query
 
-        env['pywb_proxy_magic'] = self.magic_name
+        if self.resolver.supports_switching:
+            env['pywb_proxy_magic'] = self.magic_name
 
         # route (static) and other resources to archival replay
         if env['pywb.proxy_host'] == self.magic_name:
@@ -186,8 +196,20 @@ class ProxyRouter(object):
             if response:
                 return response
 
-        host_prefix = env['pywb.proxy_scheme'] + '://' + self.magic_name
         rel_prefix = ''
+
+        custom_prefix = env.get('HTTP_PYWB_REWRITE_PREFIX', '')
+        if custom_prefix:
+            host_prefix = custom_prefix
+            urlrewriter_class = UrlRewriter
+            abs_prefix = True
+            # always rewrite to absolute here
+            rewrite_opts = dict(no_match_rel=True)
+        else:
+            host_prefix = env['pywb.proxy_scheme'] + '://' + self.magic_name
+            urlrewriter_class = SchemeOnlyUrlRewriter
+            abs_prefix = False
+            rewrite_opts = {}
 
         # special case for proxy calendar
         if (env['pywb.proxy_host'] == 'query.' + self.magic_name):
@@ -204,8 +226,9 @@ class ProxyRouter(object):
                               host_prefix=host_prefix,
                               rel_prefix=rel_prefix,
                               wburl_class=route.handler.get_wburl_type(),
-                              urlrewriter_class=HttpsUrlRewriter,
-                              use_abs_prefix=False,
+                              urlrewriter_class=urlrewriter_class,
+                              use_abs_prefix=abs_prefix,
+                              rewrite_opts=rewrite_opts,
                               is_proxy=True)
 
         if matcher:
@@ -219,14 +242,63 @@ class ProxyRouter(object):
             wbrequest.wb_url.mod = 'bn_'
         else:
         # unaltered, no rewrite or banner
-            wbrequest.wb_url.mod = 'id_'
+            wbrequest.wb_url.mod = 'uo_'
 
         response = route.handler(wbrequest)
+        if not response:
+            return None
 
+        # add extra headers for replay responses
         if wbrequest.wb_url and wbrequest.wb_url.is_replay():
             response.status_headers.replace_headers(self.extra_headers)
 
+        # check for content-length
+        res = response.status_headers.get_header('content-length')
+        try:
+            if int(res) > 0:
+                return response
+        except:
+            pass
+
+        # need to either chunk or buffer to get content-length
+        if env.get('SERVER_PROTOCOL') == 'HTTP/1.1':
+            response.status_headers.remove_header('content-length')
+            response.status_headers.headers.append(('Transfer-Encoding', 'chunked'))
+            response.body = self._chunk_encode(response.body)
+        else:
+            response.body = self._buffer_response(response.status_headers,
+                                                  response.body)
+
         return response
+
+    @staticmethod
+    def _chunk_encode(orig_iter):
+        for chunk in orig_iter:
+            if not len(chunk):
+                continue
+            chunk_len = b'%X\r\n' % len(chunk)
+            yield chunk_len
+            yield chunk
+            yield b'\r\n'
+
+        yield b'0\r\n\r\n'
+
+    @staticmethod
+    def _buffer_response(status_headers, iterator):
+        out = SpooledTemporaryFile(ProxyRouter.BUFF_RESPONSE_MEM_SIZE)
+        size = 0
+
+        for buff in iterator:
+            size += len(buff)
+            out.write(buff)
+
+        content_length_str = str(size)
+        # remove existing content length
+        status_headers.replace_header('Content-Length',
+                                      content_length_str)
+
+        out.seek(0)
+        return RewriteContent.stream_to_gen(out)
 
     def get_request_socket(self, env):
         if not self.ca:
@@ -239,8 +311,11 @@ class ProxyRouter(object):
                 import uwsgi
                 fd = uwsgi.connection_fd()
                 conn = socket.fromfd(fd, socket.AF_INET, socket.SOCK_STREAM)
-                sock = socket.socket(_sock=conn)
-            except Exception:
+                try:
+                    sock = socket.socket(_sock=conn)
+                except:
+                    sock = conn
+            except Exception as e:
                 pass
         elif env.get('gunicorn.socket'):  # pragma: no cover
             sock = env['gunicorn.socket']
@@ -248,8 +323,12 @@ class ProxyRouter(object):
         if not sock:
             # attempt to find socket from wsgi.input
             input_ = env.get('wsgi.input')
-            if input_ and hasattr(input_, '_sock'):
-                sock = socket.socket(_sock=input_._sock)
+            if input_:
+                if hasattr(input_, '_sock'):  # pragma: no cover
+                    raw = input_._sock
+                    sock = socket.socket(_sock=raw)  # pragma: no cover
+                elif hasattr(input_, 'raw'):
+                    sock = input_.raw._sock
 
         return sock
 
@@ -259,9 +338,10 @@ class ProxyRouter(object):
             return WbResponse.text_response('HTTPS Proxy Not Supported',
                                             '405 HTTPS Proxy Not Supported')
 
-        sock.send('HTTP/1.0 200 Connection Established\r\n')
-        sock.send('Server: pywb proxy\r\n')
-        sock.send('\r\n')
+        sock.send(b'HTTP/1.0 200 Connection Established\r\n')
+        sock.send(b'Proxy-Connection: close\r\n')
+        sock.send(b'Server: pywb proxy\r\n')
+        sock.send(b'\r\n')
 
         hostname, port = env['REL_REQUEST_URI'].split(':')
 
@@ -282,7 +362,7 @@ class ProxyRouter(object):
 
             buffreader = BufferedReader(ssl_sock, block_size=self.BLOCK_SIZE)
 
-            statusline = buffreader.readline().rstrip()
+            statusline = to_native_str(buffreader.readline().rstrip())
 
         except Exception as se:
             raise BadRequestException(se.message)
@@ -311,7 +391,7 @@ class ProxyRouter(object):
         env['pywb.proxy_query'] = env['QUERY_STRING']
 
         while True:
-            line = buffreader.readline()
+            line = to_native_str(buffreader.readline())
             if line:
                 line = line.rstrip()
 
@@ -332,12 +412,15 @@ class ProxyRouter(object):
 
             env[name] = value
 
-        remain = buffreader.rem_length()
-        if remain > 0:
-            remainder = buffreader.read(self.BLOCK_SIZE)
-            env['wsgi.input'] = BufferedReader(ssl_sock,
-                                               block_size=self.BLOCK_SIZE,
-                                               starting_data=remainder)
+        env['wsgi.input'] = buffreader
+        #remain = buffreader.rem_length()
+        #if remain > 0:
+            #remainder = buffreader.read()
+            #env['wsgi.input'] = BufferedReader(BytesIO(remainder))
+            #remainder = buffreader.read(self.BLOCK_SIZE)
+            #env['wsgi.input'] = BufferedReader(ssl_sock,
+            #                                   block_size=self.BLOCK_SIZE,
+            #                                   starting_data=remainder)
 
     def handle_cert_install(self, env):
         if env['pywb.proxy_req_uri'] in ('/', '/index.html', '/index.html'):
@@ -353,14 +436,16 @@ class ProxyRouter(object):
             if not self.ca:
                 return None
 
-            buff = ''
+            buff = b''
             with open(self.ca.ca_file, 'rb') as fh:
                 buff = fh.read()
 
             content_type = 'application/x-x509-ca-cert'
+            headers = [('Content-Length', str(len(buff)))]
 
-            return WbResponse.text_response(buff,
-                                            content_type=content_type)
+            return WbResponse.bin_stream([buff],
+                                         content_type=content_type,
+                                         headers=headers)
 
         elif env['pywb.proxy_req_uri'] == self.CERT_DL_P12:
             if not self.ca:
@@ -369,6 +454,8 @@ class ProxyRouter(object):
             buff = self.ca.get_root_PKCS12()
 
             content_type = 'application/x-pkcs12'
+            headers = [('Content-Length', str(len(buff)))]
 
-            return WbResponse.text_response(buff,
-                                            content_type=content_type)
+            return WbResponse.bin_stream([buff],
+                                         content_type=content_type,
+                                         headers=headers)

@@ -8,7 +8,7 @@ import webtest
 import time
 import threading
 
-from io import BytesIO
+from six import StringIO
 
 from pywb.webapp.pywb_init import create_wb_router
 from pywb.manager.manager import main
@@ -16,6 +16,7 @@ from pywb.manager.manager import main
 import pywb.manager.autoindex
 
 from pywb.warc.cdxindexer import main as cdxindexer_main
+from pywb.cdx.cdxobject import CDXObject
 
 from pywb import get_test_dir
 from pywb.framework.wsgi_wrappers import init_app
@@ -77,23 +78,24 @@ class TestManagedColls(object):
         J2TemplateView.shared_jinja_env = None
 
     #@patch('waitress.serve', lambda *args, **kwargs: None)
-    @patch('BaseHTTPServer.HTTPServer.serve_forever', lambda *args, **kwargs: None)
+    @patch('six.moves.BaseHTTPServer.HTTPServer.serve_forever', lambda *args, **kwargs: None)
     def test_run_cli(self):
         """ test new wayback cli interface
         test autoindex error before collections inited
         """
         from pywb.apps.cli import wayback
-        wayback([])
+
+        wayback(['-p', '0'])
 
         # Nothing to auto-index.. yet
         with raises(SystemExit):
-            wayback(['-a'])
+            wayback(['-a', '-p', '0'])
 
         colls = os.path.join(self.root_dir, 'collections')
         os.mkdir(colls)
 
         pywb.manager.autoindex.keep_running = False
-        wayback(['-a'])
+        wayback(['-a', '-p', '0'])
 
     def test_create_first_coll(self):
         """ Test first collection creation, with all required dirs
@@ -142,7 +144,7 @@ class TestManagedColls(object):
 
         # Spurrious file in collections
         with open(os.path.join(self.root_dir, 'collections', 'blah'), 'w+b') as fh:
-            fh.write('foo\n')
+            fh.write(b'foo\n')
 
         with raises(IOError):
             main(['add', 'test', 'non-existent-file.warc.gz'])
@@ -226,13 +228,14 @@ class TestManagedColls(object):
         a_static = os.path.join(self.root_dir, 'collections', 'test', 'static', 'abc.js')
 
         with open(a_static, 'w+b') as fh:
-            fh.write('/* Some JS File */')
+            fh.write(b'/* Some JS File */')
 
         self._create_app()
         resp = self.testapp.get('/static/test/abc.js')
         assert resp.status_int == 200
         assert resp.content_type == 'application/javascript'
-        assert '/* Some JS File */' in resp.body
+        resp.charset = 'utf-8'
+        assert '/* Some JS File */' in resp.text
 
     def test_add_shared_static(self):
         """ Test adding shared static file to root static/ dir, check access
@@ -240,13 +243,14 @@ class TestManagedColls(object):
         a_static = os.path.join(self.root_dir, 'static', 'foo.css')
 
         with open(a_static, 'w+b') as fh:
-            fh.write('/* Some CSS File */')
+            fh.write(b'/* Some CSS File */')
 
         self._create_app()
         resp = self.testapp.get('/static/__shared/foo.css')
         assert resp.status_int == 200
         assert resp.content_type == 'text/css'
-        assert '/* Some CSS File */' in resp.body
+        resp.charset = 'utf-8'
+        assert '/* Some CSS File */' in resp.text
 
     def test_add_title_metadata_index_page(self):
         """ Test adding title metadata to a collection, test
@@ -258,7 +262,8 @@ class TestManagedColls(object):
         resp = self.testapp.get('/')
         assert resp.status_int == 200
         assert resp.content_type == 'text/html'
-        assert '(Collection Title)' in resp.body
+        resp.charset = 'utf-8'
+        assert '(Collection Title)' in resp.text
 
     def test_other_metadata_search_page(self):
         main(['metadata', 'foo', '--set',
@@ -270,16 +275,17 @@ class TestManagedColls(object):
 
         self._create_app()
         resp = self.testapp.get('/foo/')
+        resp.charset = 'utf-8'
         assert resp.status_int == 200
         assert resp.content_type == 'text/html'
 
-        assert 'Collection Title' in resp.body
+        assert 'Collection Title' in resp.text
 
-        assert 'desc' in resp.body
-        assert 'Some Description Text' in resp.body
+        assert 'desc' in resp.text
+        assert 'Some Description Text' in resp.text
 
-        assert 'other' in resp.body
-        assert 'custom value' in resp.body
+        assert 'other' in resp.text
+        assert 'custom value' in resp.text
 
     def test_custom_template_search(self):
         """ Test manually added custom search template search.html
@@ -287,13 +293,14 @@ class TestManagedColls(object):
         a_static = os.path.join(self.root_dir, 'collections', 'test', 'templates', 'search.html')
 
         with open(a_static, 'w+b') as fh:
-            fh.write('pywb custom search page')
+            fh.write(b'pywb custom search page')
 
         self._create_app()
         resp = self.testapp.get('/test/')
+        resp.charset = 'utf-8'
         assert resp.status_int == 200
         assert resp.content_type == 'text/html'
-        assert 'pywb custom search page' in resp.body
+        assert 'pywb custom search page' in resp.text
 
     def test_custom_config(self):
         """ Test custom created config.yaml which overrides auto settings
@@ -302,8 +309,8 @@ class TestManagedColls(object):
         """
         config_path = os.path.join(self.root_dir, 'collections', 'test', 'config.yaml')
         with open(config_path, 'w+b') as fh:
-            fh.write('search_html: ./templates/custom_search.html\n')
-            fh.write('index_paths: ./cdx2/\n')
+            fh.write(b'search_html: ./templates/custom_search.html\n')
+            fh.write(b'index_paths: ./cdx2/\n')
 
         custom_search = os.path.join(self.root_dir, 'collections', 'test',
                                      'templates', 'custom_search.html')
@@ -312,17 +319,18 @@ class TestManagedColls(object):
         main(['metadata', 'test', '--set', 'some=value'])
 
         with open(custom_search, 'w+b') as fh:
-            fh.write('config.yaml overriden search page: ')
-            fh.write('{{ wbrequest.user_metadata | tojson }}\n')
+            fh.write(b'config.yaml overriden search page: ')
+            fh.write(b'{{ wbrequest.user_metadata | tojson }}\n')
 
         os.rename(os.path.join(self.root_dir, 'collections', 'test', INDEX_DIR),
                   os.path.join(self.root_dir, 'collections', 'test', 'cdx2'))
 
         self._create_app()
         resp = self.testapp.get('/test/')
+        resp.charset = 'utf-8'
         assert resp.status_int == 200
         assert resp.content_type == 'text/html'
-        assert 'config.yaml overriden search page: {"some": "value"}' in resp.body
+        assert 'config.yaml overriden search page: {"some": "value"}' in resp.text
 
         resp = self.testapp.get('/test/20140103030321/http://example.com?example=1')
         assert resp.status_int == 200
@@ -350,14 +358,15 @@ class TestManagedColls(object):
 
         with open(filename, 'r+b') as fh:
             buf = fh.read()
-            buf = buf.replace('</html>', 'Custom Test Homepage</html>')
+            buf = buf.replace(b'</html>', b'Custom Test Homepage</html>')
             fh.seek(0)
             fh.write(buf)
 
         self._create_app()
         resp = self.testapp.get('/')
+        resp.charset = 'utf-8'
         assert resp.content_type == 'text/html'
-        assert 'Custom Test Homepage</html>' in resp.body, resp.body
+        assert 'Custom Test Homepage</html>' in resp.text, resp.text
 
     @patch('pywb.manager.manager.get_input', lambda x: 'y')
     def test_add_template_input_yes(self):
@@ -401,15 +410,16 @@ class TestManagedColls(object):
         self._create_app()
 
         resp = self.testapp.get('/foo/')
+        resp.charset = 'utf-8'
         assert resp.status_int == 200
         assert resp.content_type == 'text/html'
-        assert 'pywb custom search page' not in resp.body
+        assert 'pywb custom search page' not in resp.text
 
     def test_list_colls(self):
         """ Test collection listing, printed to stdout
         """
         orig_stdout = sys.stdout
-        buff = BytesIO()
+        buff = StringIO()
         sys.stdout = buff
 
         try:
@@ -456,8 +466,12 @@ class TestManagedColls(object):
         assert len(cdxs) == len(cdxjs)
         assert all(x.endswith('.cdxj') for x in cdxjs)
 
-        with open(os.path.join(migrate_dir, 'iana.cdxj')) as fh:
-            assert fh.readline().startswith('org,iana)/ 20140126200624 {"url": "http://www.iana.org/",')
+        with open(os.path.join(migrate_dir, 'iana.cdxj'), 'rb') as fh:
+            cdx = CDXObject(fh.readline())
+            assert cdx['urlkey'] == 'org,iana)/'
+            assert cdx['timestamp'] == '20140126200624'
+            assert cdx['url'] == 'http://www.iana.org/'
+            #assert fh.readline().startswith('org,iana)/ 20140126200624 {"url": "http://www.iana.org/",')
 
         # Nothing else to migrate
         main(['cdx-convert', migrate_dir])
@@ -492,10 +506,10 @@ class TestManagedColls(object):
         index_file = os.path.join(auto_dir, INDEX_DIR, AUTOINDEX_FILE)
         assert os.path.isfile(index_file)
 
-        with open(index_file) as fh:
+        with open(index_file, 'r') as fh:
             index = fh.read()
 
-        assert '"example.warc.gz' in index
+        assert '"example.warc.gz' in index, index
         assert '"sub/example-extra.warc' in index, index
 
         mtime = os.path.getmtime(index_file)
@@ -592,7 +606,7 @@ class TestManagedColls(object):
 
         # CDX a file not a dir
         with open(cdx_path, 'w+b') as fh:
-            fh.write('foo\n')
+            fh.write(b'foo\n')
 
         with raises(Exception):
             self._create_app()

@@ -3,12 +3,13 @@ from pywb.utils.bufferedreaders import DecompressingBufferedReader
 from pywb.utils.canonicalize import canonicalize
 from pywb.utils.loaders import extract_post_query, append_post_query
 
-from recordloader import ArcWarcRecordLoader
+from pywb.warc.recordloader import ArcWarcRecordLoader
 
 import hashlib
 import base64
 
 import re
+import sys
 
 try:  # pragma: no cover
     from collections import OrderedDict
@@ -43,7 +44,14 @@ class ArchiveIterator(object):
     package which will create a properly chunked gzip file:
 
     warc2warc -Z myfile.{0} > myfile.{0}.gz
-    """
+"""
+
+    INC_RECORD = """\
+    WARNING: Record not followed by newline, perhaps Content-Length is invalid
+    Offset: {0}
+    Remainder: {1}
+"""
+
 
     def __init__(self, fileobj, no_record_parse=False,
                  verify_http=False):
@@ -58,7 +66,7 @@ class ArchiveIterator(object):
         self.member_info = None
         self.no_record_parse = no_record_parse
 
-    def iter_records(self, block_size=16384):
+    def __call__(self, block_size=16384):
         """ iterate over each record
         """
 
@@ -72,6 +80,7 @@ class ArchiveIterator(object):
 
         raise_invalid_gzip = False
         empty_record = False
+        record = None
 
         while True:
             try:
@@ -85,7 +94,8 @@ class ArchiveIterator(object):
             except EOFError:
                 empty_record = True
 
-            self.read_to_end(record)
+            if record:
+                self.read_to_end(record)
 
             if self.reader.decompressor:
                 # if another gzip member, continue
@@ -130,20 +140,35 @@ class ArchiveIterator(object):
 
           count empty_size so that it can be substracted from
           the record length for uncompressed
+
+          if first line read is not blank, likely error in WARC/ARC,
+          display a warning
         """
         empty_size = 0
+        first_line = True
+
         while True:
             line = self.reader.readline()
             if len(line) == 0:
                 return None, empty_size
 
-            if line.rstrip() == '':
+            stripped = line.rstrip()
+
+            if len(stripped) == 0 or first_line:
                 empty_size += len(line)
+
+                if len(stripped) != 0:
+                    # if first line is not blank,
+                    # likely content-length was invalid, display warning
+                    err_offset = self.fh.tell() - self.reader.rem_length() - empty_size
+                    sys.stderr.write(self.INC_RECORD.format(err_offset, line))
+
+                first_line = False
                 continue
 
             return line, empty_size
 
-    def read_to_end(self, record, compute_digest=False):
+    def read_to_end(self, record, payload_callback=None):
         """ Read remainder of the stream
         If a digester is included, update it
         with the data read
@@ -153,11 +178,6 @@ class ArchiveIterator(object):
         if self.member_info:
             return None
 
-        if compute_digest:
-            digester = hashlib.sha1()
-        else:
-            digester = None
-
         num = 0
         curr_offset = self.offset
 
@@ -166,8 +186,8 @@ class ArchiveIterator(object):
             if not b:
                 break
             num += len(b)
-            if digester:
-                digester.update(b)
+            if payload_callback:
+                payload_callback(b)
 
         """
         - For compressed files, blank lines are consumed
@@ -190,12 +210,7 @@ class ArchiveIterator(object):
         if not self.reader.decompressor:
             length -= empty_size
 
-        if compute_digest:
-            digest = base64.b32encode(digester.digest())
-        else:
-            digest = None
-
-        self.member_info = (curr_offset, length, digest)
+        self.member_info = (curr_offset, length)
         #return self.member_info
         #return next_line
 
@@ -220,9 +235,16 @@ class ArchiveIterator(object):
 class ArchiveIndexEntryMixin(object):
     MIME_RE = re.compile('[; ]')
 
+    def __init__(self):
+        super(ArchiveIndexEntryMixin, self).__init__()
+        self.reset_entry()
+
     def reset_entry(self):
         self['urlkey'] = ''
         self['metadata'] = ''
+        self.buffer = None
+        self.record = None
+
 
     def extract_mime(self, mime, def_mime='unk'):
         """ Utility function to extract mimetype only
@@ -231,6 +253,7 @@ class ArchiveIndexEntryMixin(object):
         self['mime'] = def_mime
         if mime:
             self['mime'] = self.MIME_RE.split(mime, 1)[0]
+            self['_content_type'] = mime
 
     def extract_status(self, status_headers):
         """ Extract status code only from status line
@@ -241,10 +264,7 @@ class ArchiveIndexEntryMixin(object):
         elif self['status'] == '204' and 'Error' in status_headers.statusline:
             self['status'] = '-'
 
-    def set_rec_info(self, offset, length, digest):
-        if digest:
-            self['digest'] = digest
-
+    def set_rec_info(self, offset, length):
         self['length'] = str(length)
         self['offset'] = str(offset)
 
@@ -273,10 +293,12 @@ class ArchiveIndexEntryMixin(object):
 
 
 #=================================================================
-class DefaultRecordIter(object):
+class DefaultRecordParser(object):
     def __init__(self, **options):
         self.options = options
         self.entry_cache = {}
+        self.digester = None
+        self.buff = None
 
     def _create_index_entry(self, rec_type):
         try:
@@ -288,23 +310,50 @@ class DefaultRecordIter(object):
             else:
                 entry = ArchiveIndexEntry()
 
-            self.entry_cache[rec_type] = entry
+            # don't reuse when using append post
+            # entry may be cached
+            if not self.options.get('append_post'):
+                self.entry_cache[rec_type] = entry
 
         return entry
 
-    def create_record_iter(self, arcv_iter):
+    def begin_payload(self, compute_digest, entry):
+        if compute_digest:
+            self.digester = hashlib.sha1()
+        else:
+            self.digester = None
+
+        self.entry = entry
+        entry.buffer = self.create_payload_buffer(entry)
+
+    def handle_payload(self, buff):
+        if self.digester:
+            self.digester.update(buff)
+
+        if self.entry and self.entry.buffer:
+            self.entry.buffer.write(buff)
+
+    def end_payload(self, entry):
+        if self.digester:
+            entry['digest'] = base64.b32encode(self.digester.digest()).decode('ascii')
+
+        self.entry = None
+
+    def create_payload_buffer(self, entry):
+        return None
+
+    def create_record_iter(self, raw_iter):
         append_post = self.options.get('append_post')
         include_all = self.options.get('include_all')
         block_size = self.options.get('block_size', 16384)
         surt_ordered = self.options.get('surt_ordered', True)
         minimal = self.options.get('minimal')
-        append_post = self.options.get('append_post')
 
         if append_post and minimal:
             raise Exception('Sorry, minimal index option and ' +
                             'append POST options can not be used together')
 
-        for record in arcv_iter.iter_records(block_size):
+        for record in raw_iter(block_size):
             entry = None
 
             if not include_all and not minimal and (record.status_headers.get_statuscode() == '-'):
@@ -342,15 +391,19 @@ class DefaultRecordIter(object):
                 len_ = record.status_headers.get_header('Content-Length')
 
                 post_query = extract_post_query(method,
-                                                entry.get('mime'),
+                                                entry.get('_content_type'),
                                                 len_,
                                                 record.stream)
 
                 entry['_post_query'] = post_query
 
-            arcv_iter.read_to_end(record, compute_digest)
-            entry.set_rec_info(*arcv_iter.member_info)
             entry.record = record
+
+            self.begin_payload(compute_digest, entry)
+            raw_iter.read_to_end(record, self.handle_payload)
+
+            entry.set_rec_info(*raw_iter.member_info)
+            self.end_payload(entry)
 
             yield entry
 
@@ -489,8 +542,15 @@ class DefaultRecordIter(object):
 
             yield entry
 
+    def open(self, filename):
+        with open(filename, 'rb') as fh:
+            for entry in self(fh):
+                yield entry
+
 class ArchiveIndexEntry(ArchiveIndexEntryMixin, dict):
     pass
 
 class OrderedArchiveIndexEntry(ArchiveIndexEntryMixin, OrderedDict):
     pass
+
+

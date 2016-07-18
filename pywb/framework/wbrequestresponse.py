@@ -112,6 +112,7 @@ class WbRequest(object):
 
     def _is_ajax(self):
         value = self.env.get('HTTP_X_REQUESTED_WITH')
+        value = value or self.env.get('HTTP_X_PYWB_REQUESTED_WITH')
         if value and value.lower() == 'xmlhttprequest':
             return True
 
@@ -183,14 +184,15 @@ class WbRequest(object):
         if not self.wb_url:
             return
 
-        mime = self.env.get('CONTENT_TYPE', '').split(';')[0]
+        mime = self.env.get('CONTENT_TYPE', '')
         length = self.env.get('CONTENT_LENGTH')
         stream = self.env['wsgi.input']
 
         buffered_stream = BytesIO()
 
         post_query = extract_post_query('POST', mime, length, stream,
-                                        buffered_stream=buffered_stream)
+                                        buffered_stream=buffered_stream,
+                                        environ=self.env)
 
         if post_query:
             self.env['wsgi.input'] = buffered_stream
@@ -214,7 +216,18 @@ class WbResponse(object):
         pass
 
     @staticmethod
-    def text_stream(stream, status='200 OK', content_type='text/plain',
+    def text_stream(stream, content_type='text/plain; charset=utf-8', status='200 OK'):
+        def encode(stream):
+            for obj in stream:
+                yield obj.encode('utf-8')
+
+        if 'charset' not in content_type:
+            content_type += '; charset=utf-8'
+
+        return WbResponse.bin_stream(encode(stream), content_type, status)
+
+    @staticmethod
+    def bin_stream(stream, content_type, status='200 OK',
                     headers=None):
         def_headers = [('Content-Type', content_type)]
         if headers:
@@ -225,12 +238,12 @@ class WbResponse(object):
         return WbResponse(status_headers, value=stream)
 
     @staticmethod
-    def text_response(text, status='200 OK', content_type='text/plain'):
+    def text_response(text, status='200 OK', content_type='text/plain; charset=utf-8'):
         status_headers = StatusAndHeaders(status,
                                           [('Content-Type', content_type),
                                            ('Content-Length', str(len(text)))])
 
-        return WbResponse(status_headers, value=[text])
+        return WbResponse(status_headers, value=[text.encode('utf-8')])
 
     @staticmethod
     def redir_response(location, status='302 Redirect', headers=None):

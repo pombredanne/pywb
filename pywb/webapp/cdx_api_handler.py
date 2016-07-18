@@ -3,9 +3,10 @@ from pywb.cdx.cdxserver import create_cdx_server
 from pywb.framework.basehandlers import BaseHandler
 from pywb.framework.wbrequestresponse import WbResponse
 
-from query_handler import QueryHandler
+from pywb.webapp.query_handler import QueryHandler
 
-from urlparse import parse_qs
+from six.moves.urllib.parse import parse_qs
+import six
 
 
 #=================================================================
@@ -22,7 +23,8 @@ class CDXAPIHandler(BaseHandler):
 
         cdx_iter = self.index_handler.load_cdx(wbrequest, params)
 
-        return WbResponse.text_stream(cdx_iter)
+        return WbResponse.text_stream(cdx_iter,
+                                      content_type='text/plain')
 
     @staticmethod
     def extract_params_from_wsgi_env(env):
@@ -35,7 +37,7 @@ class CDXAPIHandler(BaseHandler):
         # cdx processing expects singleton params for all params,
         # except filters, so convert here
         # use first value of the list
-        for name, val in params.iteritems():
+        for name, val in six.iteritems(params):
             if name != 'filter':
                 params[name] = val[0]
 

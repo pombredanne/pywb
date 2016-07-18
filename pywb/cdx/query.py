@@ -1,19 +1,30 @@
-from urllib import urlencode
-from cdxobject import CDXException
+from six.moves.urllib.parse import urlencode
+from pywb.cdx.cdxobject import CDXException
+from pywb.utils.canonicalize import calc_search_range
 
 
 #=================================================================
 class CDXQuery(object):
-    def __init__(self, **kwargs):
-        self.params = kwargs
+    def __init__(self, params):
+        self.params = params
+        url = self.url
+        url = self.params.get('alt_url', url)
         if not self.params.get('matchType'):
-            url = self.params.get('url', '')
             if url.startswith('*.'):
-                self.params['url'] = url[2:]
+                url = self.params['url'] = url[2:]
                 self.params['matchType'] = 'domain'
             elif url.endswith('*'):
-                self.params['url'] = url[:-1]
+                url = self.params['url'] = url[:-1]
                 self.params['matchType'] = 'prefix'
+            else:
+                self.params['matchType'] = 'exact'
+
+        start, end = calc_search_range(url=url,
+                                       match_type=self.params['matchType'],
+                                       url_canon=self.params.get('_url_canon'))
+
+        self.params['key'] = start.encode('utf-8')
+        self.params['end_key'] = end.encode('utf-8')
 
     @property
     def key(self):

@@ -1,19 +1,18 @@
-from pywb.utils.canonicalize import UrlCanonicalizer, calc_search_range
+from pywb.utils.canonicalize import UrlCanonicalizer
 from pywb.utils.wbexception import NotFoundException
 
-from cdxops import cdx_load
-from cdxsource import CDXSource, CDXFile, RemoteCDXSource, RedisCDXSource
-from zipnum import ZipNumCluster
-from cdxobject import CDXObject, CDXException
-from query import CDXQuery
-from cdxdomainspecific import load_domain_specific_cdx_rules
+from pywb.cdx.cdxops import cdx_load
+from pywb.cdx.cdxsource import CDXSource, CDXFile, RemoteCDXSource, RedisCDXSource
+from pywb.cdx.zipnum import ZipNumCluster
+from pywb.cdx.cdxobject import CDXObject, CDXException
+from pywb.cdx.query import CDXQuery
+from pywb.cdx.cdxdomainspecific import load_domain_specific_cdx_rules
 
 from pywb.utils.loaders import is_http
 
 from itertools import chain
 import logging
 import os
-import urlparse
 
 
 #=================================================================
@@ -63,17 +62,17 @@ class BaseCDXServer(object):
 
         raise NotFoundException(msg, url=query.url)
 
-    def _calc_search_keys(self, query):
-        return calc_search_range(url=query.url,
-                                 match_type=query.match_type,
-                                 url_canon=self.url_canon)
+    #def _calc_search_keys(self, query):
+    #    return calc_search_range(url=query.url,
+    #                             match_type=query.match_type,
+    #                             url_canon=self.url_canon)
 
     def load_cdx(self, **params):
-        query = CDXQuery(**params)
+        params['_url_canon'] = self.url_canon
+        query = CDXQuery(params)
 
-        key, end_key = self._calc_search_keys(query)
-
-        query.set_key(key, end_key)
+        #key, end_key = self._calc_search_keys(query)
+        #query.set_key(key, end_key)
 
         cdx_iter = self._load_cdx_query(query)
 
@@ -176,8 +175,8 @@ class CDXServer(BaseCDXServer):
         if filename.endswith(('.summary', '.idx')):
             return ZipNumCluster(filename, config)
 
-        # no warning for .loc
-        if not filename.endswith('.loc'):
+        # no warning for .loc or .gz (zipnum)
+        if not filename.endswith(('.loc', '.gz')):
             logging.warn('skipping unrecognized URI: %s', filename)
 
         return None

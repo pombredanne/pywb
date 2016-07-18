@@ -1,7 +1,7 @@
-import urlparse
+from six.moves.urllib.parse import urljoin, urlsplit, urlunsplit
 
-from wburl import WbUrl
-from cookie_rewriter import get_cookie_rewriter
+from pywb.rewrite.wburl import WbUrl
+from pywb.rewrite.cookie_rewriter import get_cookie_rewriter
 
 
 #=================================================================
@@ -19,8 +19,8 @@ class UrlRewriter(object):
 
     REL_SCHEME = ('//', r'\/\/', r'\\/\\/')
 
-    def __init__(self, wburl, prefix, full_prefix=None, rel_prefix=None,
-                 root_path=None, cookie_scope=None, rewrite_opts={}):
+    def __init__(self, wburl, prefix='', full_prefix=None, rel_prefix=None,
+                 root_path=None, cookie_scope=None, rewrite_opts=None):
         self.wburl = wburl if isinstance(wburl, WbUrl) else WbUrl(wburl)
         self.prefix = prefix
         self.full_prefix = full_prefix or prefix
@@ -32,9 +32,9 @@ class UrlRewriter(object):
             self.prefix_scheme = None
         self.prefix_abs = self.prefix and self.prefix.startswith(self.PROTOCOLS)
         self.cookie_scope = cookie_scope
-        self.rewrite_opts = rewrite_opts
+        self.rewrite_opts = rewrite_opts or {}
 
-        if rewrite_opts.get('punycode_links'):
+        if self.rewrite_opts.get('punycode_links'):
             self.wburl._do_percent_encode = False
 
     def rewrite(self, url, mod=None):
@@ -118,12 +118,13 @@ class UrlRewriter(object):
         return "UrlRewriter('{0}', '{1}')".format(self.wburl, self.prefix)
 
     @staticmethod
-    def urljoin(orig_url, url):
-        new_url = urlparse.urljoin(orig_url, url)
+    def urljoin(orig_url, url):  # pragma: no cover
+        new_url = urljoin(orig_url, url)
         if '../' not in new_url:
             return new_url
 
-        parts = urlparse.urlsplit(new_url)
+        # only needed in py2 as py3 urljoin resolves '../'
+        parts = urlsplit(new_url)
         scheme, netloc, path, query, frag = parts
 
         path_parts = path.split('/')
@@ -147,22 +148,31 @@ class UrlRewriter(object):
 
         parts = (scheme, netloc, path, query, frag)
 
-        new_url = urlparse.urlunsplit(parts)
+        new_url = urlunsplit(parts)
         return new_url
 
 
 #=================================================================
-class HttpsUrlRewriter(UrlRewriter):
+class SchemeOnlyUrlRewriter(UrlRewriter):
     """
-    A url rewriter which urls that start with https:// to http://
+    A url rewriter which ensures that any urls have the same
+    scheme (http or https) as the base url.
     Other urls/input is unchanged.
     """
 
-    HTTP = 'http://'
-    HTTPS = 'https://'
+    def __init__(self, *args, **kwargs):
+        super(SchemeOnlyUrlRewriter, self).__init__(*args, **kwargs)
+        self.url_scheme = self.wburl.url.split(':')[0]
+        if self.url_scheme == 'https':
+            self.opposite_scheme = 'http'
+        else:
+            self.opposite_scheme = 'https'
 
     def rewrite(self, url, mod=None):
-        return self.remove_https(url)
+        if url.startswith(self.opposite_scheme + '://'):
+            url = self.url_scheme + url[len(self.opposite_scheme):]
+
+        return url
 
     def get_new_url(self, **kwargs):
         return kwargs.get('url', self.wburl.url)
@@ -175,12 +185,3 @@ class HttpsUrlRewriter(UrlRewriter):
 
     def deprefix_url(self):
         return self.wburl.url
-
-    @staticmethod
-    def remove_https(url):
-        rw = HttpsUrlRewriter
-        if url.startswith(rw.HTTPS):
-            result = rw.HTTP + url[len(rw.HTTPS):]
-            return result
-        else:
-            return url

@@ -1,3 +1,173 @@
+pywb 0.31.0 changelist
+~~~~~~~~~~~~~~~~~~~~~~
+
+* HTML rewriting:
+   - preserve empty attrs while parsing, eg. ``<tag attr>`` instead of ``<tag attr="">``
+   - empty ``srcset`` attribute does not cause errors
+   - better error checking of empty attributes for all custom parsers
+
+* wombat/client side improvements:
+   - use ``postMessage()`` for inner replay frame -> outer frame updates
+   - Fix ``window.open()`` rewriting even if prototype is missing
+   - Fix double-slash in relative url rewriting
+   - ``Math.random()`` overrides uses correct window
+  
+* BufferedReader improvements:
+   - More lenient of partially decompressed data, return what was decompressed instead of raising exception.
+   - Support Brotli decompression, properly rewrite ``Content-Encoding: br``
+
+* Python 2/3 Compatibility:
+   - Decode all cdx fields to native string in py2
+  
+* BlockLoader improvements:
+   - support custom profile urls, eg. ``profile+http://`` which allow a custom profile to be selected if a profile loader is registered via ``BlockLoader.set_profile_loader()``
+  
+   - s3 loader: support profiles and AWS creds directly set in username/password of url
+
+* POST replay improvements:
+   - support ``multipart/form-data`` encoding same as ``x-www-form-urlencoded``
+   - support ``application/x-amf`` with experimental AMF rewriter (RewriteContentAMF rewriter)
+   - support generic post-data matching exact base64 encoded value.
+
+
+pywb 0.30.1 changelist
+~~~~~~~~~~~~~~~~~~~~~~
+
+* Rules: match rule for Twitter video.
+
+* Record Loader: Only parse ``http:`` and ``https:`` urls as HTTP in ``response``, ``request`` and ``revisit`` records.
+
+
+pywb 0.30.0 changelist
+~~~~~~~~~~~~~~~~~~~~~~
+
+* Support for Python 3.3+ in addition to Python 2.6+
+
+* statusheaders: ``to_str()`` and ``to_bytes()`` to reconstruct status line and headers, with option to exclude certain headers
+
+* cdxobject improvements:
+   - ``conv_to_json()`` for serializing to json, with optional list of fields
+   - ``to_json()`` and ``to_cdxj()``
+   - Default JSON serialization includes all fields, except starting with ``_``
+   - Default CDXJ serialization includes all fields, except urlkey and timestamp
+   - Comparison operators for cdxobject
+   - Reading cdxline as byte buffer, individual fields as strings (python 3)
+  
+* redis: full testing of ``zrangebylex`` with new fakeredis
+
+* timeutils: add ``datetime_to_iso_date``
+  
+* cdx indexing refactor: rename ``DefaultRecordIter`` -> ``DefaultRecordParser``, a callable which creates an iterator
+
+* warcrecord loader fully read streams with no content-length, don't force 204
+
+* cookie improvements:
+   - use httplib cookie pairs directly to avoid concatenated headers (eg. for ``Set-Cookie``)
+   - don't remove ``max-age`` and ``expires`` when in live rewriting mode
+   - convert `` UTC`` -> `` GMT`` in expires to avoid Python parsing issues
+   - remove ``secure`` only if not serving from https
+   - support custom cookie rewriter
+   
+* wombat/client side improvements:
+   - rewrite ``frameElement`` -> ``WB_wombat_frameElement``, set to null for top replay frame
+   - Allow changing of ``document.domain``
+   - Rewrite ``<form action>`` and <input @value>`` in ``rewrite_elem``
+ 
+* Tests: improved tests, replaced doctests of dict output to regular tests for improved compatibility with different python implementations
+  
+  
+
+
+
+pywb 0.11.5 changelist
+~~~~~~~~~~~~~~~~~~~~~~
+
+* cdx index bug fix: fix bug with cdx indexing with post-append when WARC request and response records do not alternate in the WARC.
+
+* load yaml config: ensure file stream gets closed.
+
+* zipnum: resolve paths specified in zipnum .loc file relative to the .loc file, not to application root.
+
+
+pywb 0.11.4 changelist
+~~~~~~~~~~~~~~~~~~~~~~
+
+* wombat: overrides ``window.crypto.getRandomValues()`` to use predictable 'random' values for improved
+  replayability in many JS applications.
+
+* fix gevent/uwsgi: run ``gevent.monkey.patch_all()`` explicitly when loading ``pywb.apps.wayback`` if ``GEVENT_MONKEY_PATCH=1`` env var is set. Set by default in ``uwsgi.ini`` for use with uwsgi. (Was previously relying on uwsgi ``gevent-early-monkey-patch`` but this flag is not yet available until uwsgi 2.1 is released).
+
+
+pywb 0.11.3 changelist
+~~~~~~~~~~~~~~~~~~~~~~
+
+* rewrite: fix typo in ``<meta content="">`` rewrite (modifier was not being set)
+
+
+pywb 0.11.2 changelist
+~~~~~~~~~~~~~~~~~~~~~~
+
+* Rewriting: if no charset specified in original page, don't add charset to allow browser to detect.
+
+* Rewriting: rewrite ``<meta content="">`` attribute if it is a url.
+
+* wb.js: pad shorter timestamp to 14 digits.
+
+* Indexing: fixed exception when indexing empty files.
+
+
+pywb 0.11.1 changelist
+~~~~~~~~~~~~~~~~~~~~~~
+
+* WombatLocation: overriden properties (href, host, etc...) are enumerable to match Location to support cloning methods.
+
+* WombatLocation: reload() override now works.
+   
+* Proxy: Custom ``Pywb-Rewrite-Prefix`` allows adding a custom prefix for proxy mode rewriting
+
+* Proxy: Better error for invalid collection in ip resolve mode
+   
+* Warc Indexing Refactor: Allow custom iterators to buffer payload by overriding ``create_payload_buffer()`` to return a writable buffer.
+
+
+pywb 0.11.0 changelist
+~~~~~~~~~~~~~~~~~~~~~~
+
+* New client-side test system for Wombat.js in place using Karma and SauceLabs with initial set of tests and travis integration.
+
+* Wombat Improvements:
+   - Better Safari/IE support: accessors overriden only when actually supported in browser, override gracefully skipped otherwise
+   - Use ``getOwnPropertyDescriptor()`` to get properties in addition to ``__lookupGetter__``, ``__lookupSetter__``
+   - ``baseURI`` overriden on correct prototype
+   - ``CSSStyleSheet.href`` override
+   - ``HTMLAnchorElement.toString()`` override
+   - Avoid making ``<base>.href`` read-only
+  
+* Proxy Mode Improvements:
+   - To avoid breaking HTTPS envelope, if no content-length provided, chunked encoding is used (HTTP/1.1) or response is buffered and content-length is computed (HTTP/1.0)
+   - Rewriter: Scheme-only rewriter converts embedded urls to http or https to match the scheme of containing page.
+   - IP Resolver: Supports IP cache in Redis
+   - Default resolver set to cookie resolver, eg. ``cookie_resolver: true`` is the default.
+   - Collection/datetime switching options removed from UI when auth or ip resolvers.
+  
+* Encoding: Use webencoding lib to better encode head-insert to match page encoding
+
+* Live Proxy: Support for explicit recording mode, decoupled from using http/https proxy. Enabled when ``LiveRewriter.is_recording()`` is true. By default, http/s proxies imply recording but can be overriden in derived class.
+
+* Rewriting: Convert relative urls for ``rel=canonical`` to absolute urls, even if not rewriting to ensure correct url.
+
+* UI: Use custom webkit scrollbars to minimize scrollbar-in-iframe issues that sometimes occur in Chrome.
+
+* Memento Improvements:
+   - ``/collinfo.json`` by default returns a JSON spec for all collections as Memento endpoints, in a format compatible with MemGator.
+   - ``Add /collinfo.json`` endpoint customizable via ``templates/collinfo.json`` and must be enabled with ``enable_coll_info: true``
+   - 'Not Found' error for timemap query returns empty timemap instead of standard HTML 404.
+  
+* WARC Indexing:
+  - Better detection of content-length < payload, skip to next record boundary and warn, if possible.
+  - Use ujson if proper version (without forward-slash escaping) is available when writing CDXJ
+
+
 pywb 0.10.10 changelist
 ~~~~~~~~~~~~~~~~~~~~~~
 
@@ -14,6 +184,8 @@ pywb 0.10.10 changelist
 * WARC indexing: ignore empty records when indexing and continue, rather than stopping at first empty record.
 
 * tests: refactor integration tests to run signficantly faster.
+
+* cdx-indexer
 
 
 pywb 0.10.9.1 changelist

@@ -94,8 +94,10 @@ False
 
 from pywb.framework.archivalrouter import Route, ReferRedirect, ArchivalRouter
 from pywb.framework.basehandlers import BaseHandler, WbUrlHandler
+
 import pprint
-import urlparse
+
+from six.moves.urllib.parse import urlsplit
 
 def _test_route_req(route, env, abs_path=False):
     matcher, coll = route.is_handling(env['REL_REQUEST_URI'])
@@ -113,7 +115,7 @@ def _test_route_req(route, env, abs_path=False):
 def _test_redir(match_host, request_uri, referrer, script_name='', coll='coll'):
     env = {'REL_REQUEST_URI': request_uri, 'HTTP_REFERER': referrer, 'SCRIPT_NAME': script_name}
 
-    env['HTTP_HOST'] = urlparse.urlsplit(match_host).netloc
+    env['HTTP_HOST'] = urlsplit(match_host).netloc
 
     routes = [Route(coll, WbUrlHandler())]
 

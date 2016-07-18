@@ -1,16 +1,19 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-import sys
 import re
+import sys
 
-from HTMLParser import HTMLParser, HTMLParseError
-from urlparse import urlsplit, urlunsplit
+from six.moves.html_parser import HTMLParser
+from six.moves.urllib.parse import urljoin, urlsplit, urlunsplit
 
-from url_rewriter import UrlRewriter
-from regex_rewriters import JSRewriter, CSSRewriter
 
-import cgi
+from pywb.rewrite.url_rewriter import UrlRewriter
+from pywb.rewrite.regex_rewriters import JSRewriter, CSSRewriter
+
+import six.moves.html_parser
+six.moves.html_parser.unescape = lambda x: x
+from six import text_type
 
 
 #=================================================================
@@ -75,10 +78,10 @@ class HTMLRewriterMixin(object):
             self.ls = []
 
         def write(self, string):
-            self.ls.append(bytes(string))
+            self.ls.append(string)
 
         def getvalue(self):
-            return b''.join(self.ls)
+            return ''.join(self.ls)
 
 
     # ===========================
@@ -117,7 +120,7 @@ class HTMLRewriterMixin(object):
 
     def _rewrite_meta_refresh(self, meta_refresh):
         if not meta_refresh:
-            return None
+            return ''
 
         m = self.META_REFRESH_REGEX.match(meta_refresh)
         if not m:
@@ -130,6 +133,9 @@ class HTMLRewriterMixin(object):
         return meta_refresh
 
     def _rewrite_base(self, url, mod=''):
+        if not url:
+            return ''
+
         url = self._ensure_url_has_path(url)
 
         base_url = self._rewrite_url(url, mod)
@@ -180,11 +186,11 @@ class HTMLRewriterMixin(object):
 
     def _rewrite_url(self, value, mod=None):
         if not value:
-            return None
+            return ''
 
         value = value.strip()
         if not value:
-            return None
+            return ''
 
         value = self.try_unescape(value)
         return self.url_rewriter.rewrite(value, mod)
@@ -200,27 +206,30 @@ class HTMLRewriterMixin(object):
 
         if value != new_value:
             # ensure utf-8 encoded to avoid %-encoding query here
-            if isinstance(new_value, unicode):
+            if isinstance(new_value, text_type):
                 new_value = new_value.encode('utf-8')
 
         return new_value
 
     def _rewrite_srcset(self, value, mod=''):
+        if not value:
+            return ''
+
         values = value.split(',')
-        values = map(lambda x: self._rewrite_url(x.strip()), values)
+        values = [self._rewrite_url(v.strip()) for v in values]
         return ', '.join(values)
 
     def _rewrite_css(self, css_content):
         if css_content:
             return self.css_rewriter.rewrite(css_content)
         else:
-            return None
+            return ''
 
     def _rewrite_script(self, script_content):
         if script_content:
             return self.js_rewriter.rewrite(script_content)
         else:
-            return None
+            return ''
 
     def has_attr(self, tag_attrs, attr):
         name, value = attr
@@ -230,16 +239,16 @@ class HTMLRewriterMixin(object):
         return False
 
     def _rewrite_tag_attrs(self, tag, tag_attrs):
-        # special case: script or style parse context
-        if ((tag in self.STATE_TAGS) and not self._wb_parse_context):
-            self._wb_parse_context = tag
-
         # special case: head insertion, before-head tags
-        elif (self.head_insert and
+        if (self.head_insert and
               not self._wb_parse_context
               and (tag not in self.BEFORE_HEAD_TAGS)):
             self.out.write(self.head_insert)
             self.head_insert = None
+
+        # special case: script or style parse context
+        if ((tag in self.STATE_TAGS) and not self._wb_parse_context):
+            self._wb_parse_context = tag
 
         # attr rewriting
         handler = self.rewrite_tags.get(tag)
@@ -249,6 +258,11 @@ class HTMLRewriterMixin(object):
         self.out.write('<' + tag)
 
         for attr_name, attr_value in tag_attrs:
+            empty_attr = False
+            if attr_value is None:
+                attr_value = ''
+                empty_attr = True
+
             # special case: inline JS/event handler
             if ((attr_value and attr_value.startswith('javascript:'))
                  or attr_name.startswith('on')):
@@ -276,15 +290,27 @@ class HTMLRewriterMixin(object):
             # special case: if rewrite_canon not set,
             # don't rewrite rel=canonical
             elif tag == 'link' and attr_name == 'href':
-                if (self.opts.get('rewrite_rel_canon', True) or
-                     not self.has_attr(tag_attrs, ('rel', 'canonical'))):
-                    rw_mod = handler.get(attr_name)
+                rw_mod = handler.get(attr_name)
+
+                if self.has_attr(tag_attrs, ('rel', 'canonical')):
+                    if self.opts.get('rewrite_rel_canon', True):
+                        attr_value = self._rewrite_url(attr_value, rw_mod)
+                    else:
+                        # resolve relative rel=canonical URLs so that they
+                        # refer to the same absolute URL as on the original
+                        # page (see https://github.com/hypothesis/via/issues/65
+                        # for context)
+                        attr_value = urljoin(self.orig_url, attr_value)
+                else:
                     attr_value = self._rewrite_url(attr_value, rw_mod)
 
             # special case: meta tag
             elif (tag == 'meta') and (attr_name == 'content'):
                 if self.has_attr(tag_attrs, ('http-equiv', 'refresh')):
                     attr_value = self._rewrite_meta_refresh(attr_value)
+                elif attr_value.startswith(self.DATA_RW_PROTOCOLS):
+                    rw_mod = handler.get(attr_name)
+                    attr_value = self._rewrite_url(attr_value, rw_mod)
 
             # special case: param value, conditional rewrite
             elif (tag == 'param'):
@@ -309,7 +335,7 @@ class HTMLRewriterMixin(object):
                     attr_value = self._rewrite_url(attr_value, rw_mod)
 
             # write the attr!
-            self._write_attr(attr_name, attr_value)
+            self._write_attr(attr_name, attr_value, empty_attr)
 
         return True
 
@@ -332,11 +358,17 @@ class HTMLRewriterMixin(object):
 
         return True
 
-    def _write_attr(self, name, value):
-        # parser doesn't differentiate between 'attr=""' and just 'attr'
-        # 'attr=""' is more common, so use that form
-        if value:
+    def _write_attr(self, name, value, empty_attr):
+        # if empty_attr is set, just write 'attr'!
+        if empty_attr:
+            self.out.write(' ' + name)
+
+        # write with value, if set
+        elif value:
+
             self.out.write(' ' + name + '="' + value.replace('"', '&quot;') + '"')
+
+        # otherwise, 'attr=""' is more common, so use that form
         else:
             self.out.write(' ' + name + '=""')
 
@@ -388,7 +420,11 @@ class HTMLRewriter(HTMLRewriterMixin, HTMLParser):
     PARSETAG = re.compile('[<]')
 
     def __init__(self, *args, **kwargs):
-        HTMLParser.__init__(self)
+        if sys.version_info > (3,4):  #pragma: no cover
+            HTMLParser.__init__(self, convert_charrefs=False)
+        else:  #pragma: no cover
+            HTMLParser.__init__(self)
+
         super(HTMLRewriter, self).__init__(*args, **kwargs)
 
     def reset(self):
@@ -402,8 +438,9 @@ class HTMLRewriter(HTMLRewriterMixin, HTMLParser):
     def feed(self, string):
         try:
             HTMLParser.feed(self, string)
-        except HTMLParseError:  # pragma: no cover
-            # only raised in 2.6
+        except Exception as e:  # pragma: no cover
+            import traceback
+            traceback.print_exc()
             self.out.write(string)
 
     def _internal_close(self):
@@ -420,7 +457,7 @@ class HTMLRewriter(HTMLRewriterMixin, HTMLParser):
 
         try:
             HTMLParser.close(self)
-        except HTMLParseError:  # pragma: no cover
+        except Exception:  # pragma: no cover
             # only raised in 2.6
             pass
 
@@ -455,7 +492,7 @@ class HTMLRewriter(HTMLRewriterMixin, HTMLParser):
     # overriding regex so that these are no longer called
     #def handle_entityref(self, data):
     #    self.out.write('&' + data + ';')
-    #
+
     #def handle_charref(self, data):
     #    self.out.write('&#' + data + ';')
 

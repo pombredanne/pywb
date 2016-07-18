@@ -1,7 +1,7 @@
-from SocketServer import ThreadingMixIn
-from BaseHTTPServer import HTTPServer, BaseHTTPRequestHandler
+from six.moves.socketserver import ThreadingMixIn
+from six.moves.BaseHTTPServer import HTTPServer, BaseHTTPRequestHandler
 
-from server_thread import ServerThreadRunner
+from .server_thread import ServerThreadRunner
 
 from pywb.webapp.live_rewrite_handler import RewriteHandler
 from pywb.webapp.pywb_init import create_wb_router
@@ -10,7 +10,7 @@ from pywb.framework.wsgi_wrappers import init_app
 import webtest
 import shutil
 
-import pywb.webapp.live_rewrite_handler
+import pywb.rewrite.rewrite_live
 
 
 #=================================================================
@@ -38,9 +38,9 @@ class ProxyRequest(BaseHTTPRequestHandler):
 
         self.send_header('x-proxy', 'test')
         self.send_header('content-length', str(len(buff)))
-        self.send_header('content-type', 'text/plain')
+        self.send_header('content-type', 'text/plain; charset=utf-8')
         self.end_headers()
-        self.wfile.write(buff)
+        self.wfile.write(buff.encode('utf-8'))
         self.wfile.close()
 
     def do_PUTMETA(self):
@@ -53,7 +53,7 @@ class MockYTDWrapper(object):
         return {'mock': 'youtube_dl_data'}
 
 
-pywb.webapp.live_rewrite_handler.YoutubeDLWrapper = MockYTDWrapper
+pywb.rewrite.rewrite_live.youtubedl = MockYTDWrapper()
 
 
 #=================================================================
@@ -73,7 +73,7 @@ def setup_module():
 
     config = dict(collections=dict(rewrite='$liveweb'),
                   framed_replay=True,
-                  proxyhostport=server.proxy_dict)
+                  proxyhostport=server.proxy_str)
 
     global cache
     cache = {}
@@ -115,11 +115,11 @@ class TestProxyLiveRewriter:
         assert len(self.requestlog) == 1
 
         # equal to returned response (echo)
-        assert self.requestlog[0] == resp.body
+        assert self.requestlog[0] == resp.text
         assert resp.headers['x-archive-orig-x-proxy'] == 'test'
 
-        assert resp.body.startswith('GET http://example.com/ HTTP/1.1')
-        assert 'referer: http://other.example.com' in resp.body
+        assert resp.text.startswith('GET http://example.com/ HTTP/1.1')
+        assert 'referer: http://other.example.com' in resp.text.lower()
 
         assert len(self.cache) == 0
 
@@ -135,7 +135,7 @@ class TestProxyLiveRewriter:
         assert len(self.requestlog) == 1
 
         # proxied, but without range
-        assert self.requestlog[0] == resp.body
+        assert self.requestlog[0] == resp.text
         assert resp.headers['x-archive-orig-x-proxy'] == 'test'
 
         assert self.requestlog[0].startswith('GET http://example.com/ HTTP/1.1')
@@ -145,7 +145,7 @@ class TestProxyLiveRewriter:
 
     def test_echo_proxy_bounded_noproxy_range(self):
         headers = [('Range', 'bytes=10-1000')]
-        resp = self.testapp.get('/rewrite/http://example.com/foobar', headers=headers)
+        resp = self.testapp.get('/rewrite/http://httpbin.org/range/1024', headers=headers)
 
         # actual response is with range
         assert resp.status_int == 206
@@ -153,7 +153,7 @@ class TestProxyLiveRewriter:
         assert resp.headers['Accept-Ranges'] == 'bytes'
 
         # not from proxy
-        assert 'x-archive-orig-x-proxy' not in resp.headers
+        assert 'x-proxy' not in resp.headers
 
         # proxy receives a request also, but w/o range
         assert len(self.requestlog) == 1
@@ -161,20 +161,20 @@ class TestProxyLiveRewriter:
         # proxy receives different request than our response
         assert self.requestlog[0] != resp.body
 
-        assert self.requestlog[0].startswith('GET http://example.com/foobar HTTP/1.1')
+        assert self.requestlog[0].startswith('GET http://httpbin.org/range/1024 HTTP/1.1')
 
         # no range request
         assert 'range: ' not in self.requestlog[0]
 
         # r: key cached
         assert len(self.cache) == 1
-        assert RewriteHandler.create_cache_key('r:', 'http://example.com/foobar') in self.cache
+        assert RewriteHandler.create_cache_key('r:', 'http://httpbin.org/range/1024') in self.cache
 
         # Second Request
         # clear log
         self.requestlog.pop()
         headers = [('Range', 'bytes=101-150')]
-        resp = self.testapp.get('/rewrite/http://example.com/foobar', headers=headers)
+        resp = self.testapp.get('/rewrite/http://httpbin.org/range/1024', headers=headers)
 
         # actual response is with range
         assert resp.status_int == 206
